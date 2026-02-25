@@ -3,8 +3,10 @@ __pycache__/
 *.pyc
 *.pyo
 
-# GADDAG binary (auto-built on first run, 28MB)
+# Word data (auto-built on first run, contains NASPA word list)
 engine/data/gaddag_compact.bin
+engine/data/crossplay_dict.pkl
+engine/data/crossplay_dict_enhanced.pkl
 
 # IDE
 .vscode/
