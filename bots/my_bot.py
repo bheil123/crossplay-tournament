@@ -15,15 +15,51 @@ Exercises (in order of difficulty):
 from bots.base_engine import BaseEngine
 
 
+LEAVE_VALUES = {
+    '?': 25.0,
+    'S': 8.0,
+    'R': 2.0,
+    'N': 1.5,
+    'E': 1.0,
+    'T': 1.0,
+    'L': 0.5,
+    'A': 0.5,
+    'I': 0.0,
+    'D': 0.0,
+    'O': -0.5,
+    'U': -1.5,
+}
+
+DUPLICATE_PENALTY = -3.0
+
+
+def evaluate_leave(leave):
+    value = 0.0
+
+    for tile in leave:
+        value += LEAVE_VALUES.get(tile, -0.5)
+
+    # Penalize duplicate tiles
+    seen = set()
+    for tile in leave:
+        if tile in seen:
+            value += DUPLICATE_PENALTY
+        seen.add(tile)
+
+    # Penalize all-vowel or all-consonant leaves
+    vowels = sum(1 for t in leave if t in 'AEIOU')
+    consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU')
+    if len(leave) >= 3 and (vowels == 0 or consonants == 0):
+        value -= 5.0
+
+    return value
+
+
 class MyBot(BaseEngine):
 
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
 
-        # YOUR STRATEGY HERE
-        # Right now this just picks a random move (same as RandomBot).
-        # Change this to beat RandomBot!
-
-        import random
-        return random.choice(moves)
+        # Exercise 2: Pick the move with the best score + leave quality.
+        return max(moves, key=lambda m: m['score'] + evaluate_leave(m['leave']))
