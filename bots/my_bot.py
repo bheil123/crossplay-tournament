@@ -244,12 +244,7 @@ class MyBot(BaseEngine):
         if not moves:
             return None
 
-        if self._game_start is None:
-            self._game_start = time.time()
-
-        turn_start    = time.time()
-        move_number   = game_info.get('move_number', '?')
-        tiles_in_bag  = game_info.get('tiles_in_bag', 1)
+        tiles_in_bag = game_info.get('tiles_in_bag', 1)
 
         # Exercise 4: Endgame -- bag empty, just maximize score
         if tiles_in_bag == 0:
@@ -259,40 +254,5 @@ class MyBot(BaseEngine):
         unseen   = unseen_tiles(board, rack, game_info)
         def_mult = defensive_multiplier(unseen, game_info)
 
-        unseen_list = []
-        for tile, count in unseen.items():
-            unseen_list.extend([tile] * count)
-
-        # Select top candidates by static eval (Exercises 2 + 3 + 5)
-        candidates = sorted(
-            moves[:25],
-            key=lambda m: static_eval(board, m, def_mult),
-            reverse=True
-        )[:N_CANDIDATES]
-
-        # If we have enough unseen tiles, run simulation
-        if len(unseen_list) >= 7:
-            if VERBOSE:
-                print(f"  [G{self._game_num+1} T{move_number}] "
-                      f"simulating {len(candidates)} cands x {N_SAMPLES} samples "
-                      f"(bag={tiles_in_bag}, rack={rack})", end='', flush=True)
-
-            best_move   = None
-            best_equity = float('-inf')
-
-            for move in candidates:
-                equity = simulate_move(board, move, game_info, unseen_list)
-                if equity > best_equity:
-                    best_equity = equity
-                    best_move   = move
-
-            turn_elapsed = time.time() - turn_start
-            self._turn_times.append(turn_elapsed)
-
-            if VERBOSE:
-                print(f" -> {best_move['word']} (eq={best_equity:+.1f}) | {turn_elapsed:.1f}s")
-
-            return best_move
-
-        # Fallback: static eval (very late game when bag nearly empty)
-        return candidates[0]
+        # Pick best move by static eval (leave + defense + opponent modeling)
+        return max(moves[:25], key=lambda m: static_eval(board, m, def_mult))
