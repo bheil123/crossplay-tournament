@@ -1,9 +1,9 @@
 """
-MyBot -- Monte Carlo simulation with Quackle-calibrated leave values.
+Strategy 5: Fast Monte Carlo simulation (Quackle-style).
 
-Strategy (Maven/Quackle-inspired):
-  1. Rank top N_CANDIDATES moves by static eval (Quackle leave values)
-  2. For each candidate, sample N_SAMPLES random opponent racks from unseen tiles
+Direct implementation of Maven/Quackle's core simulation strategy:
+  1. Pick top N_CANDIDATES moves by static eval (Quackle leave values)
+  2. For each candidate, sample N_SAMPLES random opponent racks
   3. Find opponent's best static response for each sample
   4. Pick move maximizing: our_score + our_leave_value - avg_opponent_score
 
@@ -11,7 +11,7 @@ Research basis: Sheppard (2002) — simulation provides "the deepest insight
 into Scrabble positions." Maven uses ~300 iterations; we use N_SAMPLES=5
 for speed (tradeoff: noisier but feasible in Python).
 
-Results: 60-40 vs DefensiveBot over 100 games (+22.5 avg spread).
+Only simulate mid-game (bag >= 15). Use static eval in endgame.
 """
 import random
 from bots.base_engine import BaseEngine, get_legal_moves
@@ -20,7 +20,6 @@ from engine.config import TILE_DISTRIBUTION
 N_CANDIDATES = 5
 N_SAMPLES    = 5
 
-# Quackle single-tile leave values (O'Laughlin calibration)
 QUACKLE_TILE_VALUES = {
     '?': 25.57, 'S':  8.04, 'Z':  5.12, 'X':  3.31,
     'R':  1.10, 'H':  1.09, 'C':  0.85, 'M':  0.58,
@@ -38,11 +37,11 @@ def quackle_leave_value(leave, unseen=None):
     consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
     if len(leave) >= 2:
         if vowels == 1 and consonants >= 1:
-            value += 2.0   # balanced leave bonus
+            value += 2.0
         elif vowels >= 2 and consonants == 0:
-            value -= 5.0   # pure-vowel glut penalty
+            value -= 5.0
     if 'Q' in leave and unseen is not None and unseen.get('U', 0) == 0:
-        value -= 8.0       # Q without U is nearly unplayable
+        value -= 8.0
     return value
 
 
@@ -90,7 +89,7 @@ def _simulate(board, move, unseen_list, game_info):
     return sum(opp_scores) / len(opp_scores) if opp_scores else 0.0
 
 
-class MyBot(BaseEngine):
+class BotFastSim(BaseEngine):
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
@@ -100,7 +99,7 @@ class MyBot(BaseEngine):
 
         unseen = unseen_tiles(board, rack, game_info)
 
-        # Rank candidates by static eval (Quackle leave values)
+        # Static-eval ranking for candidate selection
         candidates = sorted(
             moves[:20],
             key=lambda m: m['score'] + quackle_leave_value(m.get('leave', ''), unseen),

@@ -39,7 +39,7 @@ Opponent picks by score+leave, we record their raw score.
 
 ---
 
-## v5-greedy (current)
+## v5-greedy
 **Tag:** `v5-greedy`
 **Strategy:** Pure greedy — always take the highest-scoring move. No leave eval, no defense.
 **Results:** vs DefensiveBot: **51-49**, avg spread +5.2 (~2.5 min/100 games)
@@ -58,3 +58,31 @@ Opponent picks by score+leave, we record their raw score.
 each turn is optimal. Complexity (leave eval, stage logic, spread adaptation)
 all hurt performance. BingoFisher scores highest on average (434.2) but
 still loses more games — holding blanks is costly.
+
+---
+
+## v6-fast-sim (current)
+**Tag:** `v6-fast-sim`
+**Strategy:** Monte Carlo simulation with Quackle-calibrated leave values.
+- Quackle single-tile leave values (O'Laughlin calibration): ?=25.57, S=8.04, Z=5.12, X=3.31, vowels negative (U=-5.10, O=-2.50, I=-2.07, A=-0.63)
+- Vowel/consonant balance adjustments (+2 for balanced 1V+1C, -5 for pure vowels)
+- Q-without-U penalty (-8 when no U in unseen)
+- 1-ply Monte Carlo: top 5 candidates × 5 opponent samples → pick min avg_opp
+- Static eval only when bag < 15
+**Results:** vs DefensiveBot: **60-40**, avg spread +22.5 (~52 min/100 games)
+
+### 5-strategy research comparison (all vs DefensiveBot, 100 games each)
+
+| Strategy | Wins | Losses | Win% | Avg Spread | Time |
+|----------|------|--------|------|------------|------|
+| FastSim (Monte Carlo + Quackle leave) | **60** | 40 | **60%** | **+22.5** | 3099s |
+| QuackleLeave (calibrated static eval) | 55 | 45 | 55% | +13.7 | 214s |
+| TileEfficiency (turnover bonus) | 52 | 47 | 52% | +12.7 | 250s |
+| MinVariance (minimize opp variance) | 51 | 48 | 51% | ±0.0 | 2828s |
+| EndgameExpert (minimax when bag=0) | 42 | 56 | 42% | -18.7 | 345s |
+
+**Takeaway:** Simulation wins. Quackle-calibrated leave values are a clear
+upgrade over naive heuristics. Minimizing opponent variance (MinVariance) adds
+no value at N_SAMPLES=5 — too noisy. Endgame minimax backfired due to
+over-aggressive pre-endgame defense. Pure calibrated leave (QuackleLeave) is
+the best fast option at 55% with normal speed.

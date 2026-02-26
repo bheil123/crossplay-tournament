@@ -1,26 +1,27 @@
 """
-MyBot -- Monte Carlo simulation with Quackle-calibrated leave values.
+Strategy 3: Minimize opponent scoring variance (mini-simulation).
 
-Strategy (Maven/Quackle-inspired):
-  1. Rank top N_CANDIDATES moves by static eval (Quackle leave values)
-  2. For each candidate, sample N_SAMPLES random opponent racks from unseen tiles
-  3. Find opponent's best static response for each sample
-  4. Pick move maximizing: our_score + our_leave_value - avg_opponent_score
+From César Del Solar's research: "a simple heuristic using lowest standard
+deviation after simulation beat Quackle 62-70% of the time."
 
-Research basis: Sheppard (2002) — simulation provides "the deepest insight
-into Scrabble positions." Maven uses ~300 iterations; we use N_SAMPLES=5
-for speed (tradeoff: noisier but feasible in Python).
+The idea: after each candidate move, sample N opponent racks and find their
+best response. Prefer moves where:
+  1. The opponent's average score is low (we're not handing them easy points)
+  2. The opponent's score VARIANCE is low (no big lucky shots available)
 
-Results: 60-40 vs DefensiveBot over 100 games (+22.5 avg spread).
+Equity formula: our_score + our_leave - avg_opp - 0.5 * std_opp
+
+Low variance = consistent, controlled position.
+High variance = we're gambling that opponent gets a bad rack.
 """
 import random
+import math
 from bots.base_engine import BaseEngine, get_legal_moves
-from engine.config import TILE_DISTRIBUTION
+from engine.config import TILE_DISTRIBUTION, BONUS_SQUARES
 
 N_CANDIDATES = 5
 N_SAMPLES    = 5
 
-# Quackle single-tile leave values (O'Laughlin calibration)
 QUACKLE_TILE_VALUES = {
     '?': 25.57, 'S':  8.04, 'Z':  5.12, 'X':  3.31,
     'R':  1.10, 'H':  1.09, 'C':  0.85, 'M':  0.58,
@@ -38,11 +39,11 @@ def quackle_leave_value(leave, unseen=None):
     consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
     if len(leave) >= 2:
         if vowels == 1 and consonants >= 1:
-            value += 2.0   # balanced leave bonus
+            value += 2.0
         elif vowels >= 2 and consonants == 0:
-            value -= 5.0   # pure-vowel glut penalty
+            value -= 5.0
     if 'Q' in leave and unseen is not None and unseen.get('U', 0) == 0:
-        value -= 8.0       # Q without U is nearly unplayable
+        value -= 8.0
     return value
 
 
@@ -61,8 +62,8 @@ def unseen_tiles(board, rack, game_info):
     return {k: v for k, v in remaining.items() if v > 0}
 
 
-def _simulate(board, move, unseen_list, game_info):
-    """Place move, sample N_SAMPLES opponent racks, return avg opponent score."""
+def _opp_scores_after(board, move, unseen, game_info):
+    """Sample N_SAMPLES opponent racks, return list of their best scores."""
     new_blanks = list(game_info.get('blanks_on_board', []))
     for idx in move.get('blanks_used', []):
         word, row, col = move['word'], move['row'], move['col']
@@ -74,23 +75,25 @@ def _simulate(board, move, unseen_list, game_info):
 
     placed = board.place_move(move['word'], move['row'], move['col'],
                               move['direction'] == 'H')
-    opp_scores = []
+
+    unseen_list = [t for t, cnt in unseen.items() for _ in range(cnt)]
+    scores = []
     for _ in range(N_SAMPLES):
         random.shuffle(unseen_list)
-        opp_rack  = ''.join(unseen_list[:min(7, len(unseen_list))])
+        opp_rack = ''.join(unseen_list[:min(7, len(unseen_list))])
         opp_moves = get_legal_moves(board, opp_rack, new_blanks)
         if opp_moves:
             best = max(opp_moves,
                        key=lambda m: m['score'] + quackle_leave_value(m.get('leave', '')))
-            opp_scores.append(best['score'])
+            scores.append(best['score'])
         else:
-            opp_scores.append(0)
+            scores.append(0)
 
     board.undo_move(placed)
-    return sum(opp_scores) / len(opp_scores) if opp_scores else 0.0
+    return scores
 
 
-class MyBot(BaseEngine):
+class BotMinVariance(BaseEngine):
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
@@ -100,29 +103,35 @@ class MyBot(BaseEngine):
 
         unseen = unseen_tiles(board, rack, game_info)
 
-        # Rank candidates by static eval (Quackle leave values)
+        # Rank candidates by static eval
         candidates = sorted(
             moves[:20],
             key=lambda m: m['score'] + quackle_leave_value(m.get('leave', ''), unseen),
             reverse=True
         )[:N_CANDIDATES]
 
-        # Skip simulation near endgame (too few tiles for meaningful sampling)
+        # Skip simulation late in endgame
         if tiles_in_bag < 15:
             return candidates[0]
-
-        unseen_list = [t for t, cnt in unseen.items() for _ in range(cnt)]
 
         best_move   = None
         best_equity = float('-inf')
 
         for move in candidates:
-            avg_opp = _simulate(board, move, unseen_list, game_info)
-            equity  = (move['score']
-                       + quackle_leave_value(move.get('leave', ''), unseen)
-                       - avg_opp)
+            opp_scores = _opp_scores_after(board, move, unseen, game_info)
+            n = len(opp_scores)
+            avg_opp = sum(opp_scores) / n
+            variance = sum((s - avg_opp) ** 2 for s in opp_scores) / n
+            std_opp = math.sqrt(variance)
+
+            # Penalize high variance: opponent might get lucky
+            equity = (move['score']
+                      + quackle_leave_value(move.get('leave', ''), unseen)
+                      - avg_opp
+                      - 0.5 * std_opp)
+
             if equity > best_equity:
                 best_equity = equity
-                best_move   = move
+                best_move = move
 
         return best_move or candidates[0]
