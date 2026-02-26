@@ -231,6 +231,50 @@ Your code goes in `bots/my_bot.py` only.
 The `examples/` folder has spoiler solutions -- look at them if you're
 stuck, but try the exercises yourself first!
 
+## Speed tiers (BOT_TIER)
+
+The match runner supports a `--tier` flag that sets the `BOT_TIER`
+environment variable before loading engines. Any bot can read this to
+adjust how much time it spends thinking.
+
+```bash
+python play_match.py my_bot random_bot --tier standard
+```
+
+| Tier | Target avg/move | Typical settings | Use case |
+|------|----------------|-----------------|----------|
+| `blitz` | ~1s | N=15, K=500, SE=1.5 | Quick testing, 100+ game runs |
+| `fast` | ~3s | N=25, K=1000, SE=1.0 | Default tournament play |
+| `standard` | ~10s | N=40, K=2000, SE=0.7 | Full-strength evaluation |
+| `deep` | ~30s | N=55, K=3000, SE=0.45 | Maximum strength |
+
+**How to make your bot tier-aware (optional):**
+
+```python
+import os
+
+class MyBot(BaseEngine):
+    def __init__(self):
+        tier = os.environ.get('BOT_TIER', 'fast')
+        if tier == 'blitz':
+            self.n_samples = 2
+        elif tier == 'deep':
+            self.n_samples = 50
+        else:
+            self.n_samples = 10
+```
+
+If your bot doesn't check `BOT_TIER`, it runs identically at all tiers.
+The env var is a convention, not a requirement.
+
+**Performance model (i7-8700, 8 MC workers):**
+- MC time per move = `N_candidates * avg_sims / (workers * sims_per_sec)`
+- ~350 sims/sec/worker average across a game
+- Early stopping (SE threshold) controls actual sims: SE=1.5 -> ~140 avg,
+  SE=1.0 -> ~300 avg, SE=0.7 -> ~612 avg, SE=0.45 -> ~1481 avg
+- Positional heuristics (risk, blocking, DLS exposure): <25ms, always free
+- Move generation (by match runner): ~0.1-0.3s fixed cost
+
 ## Debugging tips
 
 - Use `--watch` to see the board after every move

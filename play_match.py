@@ -79,6 +79,8 @@ def play_game(engine1, engine2, watch=False):
     engines = [engine1, engine2]
     racks = [rack1, rack2]
     scores = [0, 0]
+    # Per-engine timing stats
+    move_times = [[], []]  # list of pick_move durations per engine
 
     if watch:
         print(f"\n{'='*60}")
@@ -96,7 +98,7 @@ def play_game(engine1, engine2, watch=False):
             if final_turns_left is not None:
                 if final_turns_left <= 0:
                     # Game over
-                    return _game_result(engines, scores, watch)
+                    return _game_result(engines, scores, move_times, watch)
                 final_turns_left -= 1
 
             # Build game_info
@@ -111,8 +113,10 @@ def play_game(engine1, engine2, watch=False):
             # Generate legal moves
             moves = get_legal_moves(board, rack, blanks_on_board)
 
-            # Ask engine to pick a move
+            # Ask engine to pick a move (timed)
+            t_pick = time.time()
             chosen = engine.pick_move(board, rack, moves, game_info)
+            move_times[player_idx].append(time.time() - t_pick)
 
             if chosen is None or not moves:
                 # Pass
@@ -131,7 +135,7 @@ def play_game(engine1, engine2, watch=False):
                 })
 
                 if consecutive_passes >= 4:
-                    return _game_result(engines, scores, watch)
+                    return _game_result(engines, scores, move_times, watch)
                 continue
 
             consecutive_passes = 0
@@ -190,10 +194,10 @@ def play_game(engine1, engine2, watch=False):
                 'blanks_on_board': list(blanks_on_board),
             })
 
-    return _game_result(engines, scores, watch)
+    return _game_result(engines, scores, move_times, watch)
 
 
-def _game_result(engines, scores, watch):
+def _game_result(engines, scores, move_times, watch):
     """Build and optionally display game result."""
     if scores[0] > scores[1]:
         result = 'win'
@@ -228,6 +232,8 @@ def _game_result(engines, scores, watch):
         'score2': scores[1],
         'spread': scores[0] - scores[1],
         'winner': engines[0].name if scores[0] > scores[1] else (engines[1].name if scores[1] > scores[0] else 'tie'),
+        'move_times_1': move_times[0],
+        'move_times_2': move_times[1],
     }
 
 
@@ -291,6 +297,8 @@ def run_match(engine1, engine2, num_games, watch=False):
     total_spread = 0
     total_score1 = 0
     total_score2 = 0
+    # Per-engine timing aggregation (keyed by engine name)
+    all_move_times = {engine1.name: [], engine2.name: []}
     t_start = time.time()
 
     for i in range(num_games):
@@ -302,6 +310,14 @@ def run_match(engine1, engine2, num_games, watch=False):
             # Flip scores for consistent tracking
             result['score1'], result['score2'] = result['score2'], result['score1']
             result['spread'] = -result['spread']
+
+        # Aggregate move times (engine order alternates each game)
+        if i % 2 == 0:
+            all_move_times[engine1.name].extend(result.get('move_times_1', []))
+            all_move_times[engine2.name].extend(result.get('move_times_2', []))
+        else:
+            all_move_times[engine2.name].extend(result.get('move_times_1', []))
+            all_move_times[engine1.name].extend(result.get('move_times_2', []))
 
         total_score1 += result['score1']
         total_score2 += result['score2']
@@ -330,7 +346,33 @@ def run_match(engine1, engine2, num_games, watch=False):
     print(f"  {engine1.name} avg: {total_score1 / num_games:>6.1f}  |  {engine2.name} avg: {total_score2 / num_games:>6.1f}")
     elapsed = time.time() - t_start
     print(f"  Time: {elapsed:.1f}s ({num_games / elapsed:.1f} games/s)")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Speed report
+    tier = os.environ.get('BOT_TIER', None)
+    tier_targets = {'blitz': 1.0, 'fast': 3.0, 'standard': 10.0, 'deep': 30.0}
+    target = tier_targets.get(tier) if tier else None
+
+    print(f"\n  Speed Report{f' (tier: {tier})' if tier else ''}:")
+    for name in [engine1.name, engine2.name]:
+        times = all_move_times.get(name, [])
+        if not times:
+            print(f"    {name}: no moves recorded")
+            continue
+        avg_t = sum(times) / len(times)
+        max_t = max(times)
+        p95_idx = int(len(times) * 0.95)
+        sorted_t = sorted(times)
+        p95_t = sorted_t[min(p95_idx, len(sorted_t) - 1)]
+        status = ""
+        if target:
+            if avg_t <= target * 1.2:
+                status = " [OK]"
+            else:
+                status = f" [OVER -- target ~{target:.0f}s]"
+        print(f"    {name}: avg {avg_t:.2f}s, p95 {p95_t:.2f}s, max {max_t:.2f}s"
+              f" ({len(times)} moves){status}")
+    print()
 
 
 def run_tournament(num_games):
@@ -344,8 +386,10 @@ def run_tournament(num_games):
     print(f"Building GADDAG (first run takes ~48s, then cached)...\n")
 
     results = {}
+    all_move_times = {}  # per-bot timing aggregation
     for name in bot_names:
         results[name] = {'wins': 0, 'losses': 0, 'ties': 0, 'spread': 0, 'games': 0}
+        all_move_times[name] = []
 
     for i in range(len(bot_names)):
         for j in range(i + 1, len(bot_names)):
@@ -357,8 +401,12 @@ def run_tournament(num_games):
             for g in range(num_games):
                 if g % 2 == 0:
                     r = play_game(e1, e2)
+                    all_move_times[e1.name].extend(r.get('move_times_1', []))
+                    all_move_times[e2.name].extend(r.get('move_times_2', []))
                 else:
                     r = play_game(e2, e1)
+                    all_move_times[e2.name].extend(r.get('move_times_1', []))
+                    all_move_times[e1.name].extend(r.get('move_times_2', []))
                     r['score1'], r['score2'] = r['score2'], r['score1']
                     r['spread'] = -r['spread']
 
@@ -394,7 +442,33 @@ def run_tournament(num_games):
     for name, stats in standings:
         avg_sp = stats['spread'] / max(1, stats['games'])
         print(f"  {name:<20} {stats['wins']:>4} {stats['losses']:>4} {stats['ties']:>4} {avg_sp:>+7.1f}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+
+    # Speed report
+    tier = os.environ.get('BOT_TIER', None)
+    tier_targets = {'blitz': 1.0, 'fast': 3.0, 'standard': 10.0, 'deep': 30.0}
+    target = tier_targets.get(tier) if tier else None
+
+    print(f"\n  Speed Report{f' (tier: {tier})' if tier else ''}:")
+    for name in bot_names:
+        times = all_move_times.get(name, [])
+        if not times:
+            print(f"    {name}: no moves recorded")
+            continue
+        avg_t = sum(times) / len(times)
+        max_t = max(times)
+        p95_idx = int(len(times) * 0.95)
+        sorted_t = sorted(times)
+        p95_t = sorted_t[min(p95_idx, len(sorted_t) - 1)]
+        status = ""
+        if target:
+            if avg_t <= target * 1.2:
+                status = " [OK]"
+            else:
+                status = f" [OVER -- target ~{target:.0f}s]"
+        print(f"    {name}: avg {avg_t:.2f}s, p95 {p95_t:.2f}s, max {max_t:.2f}s"
+              f" ({len(times)} moves){status}")
+    print()
 
 
 # =========================================================================
@@ -408,8 +482,14 @@ def main():
     parser.add_argument('--games', type=int, default=10, help='Number of games (default: 10)')
     parser.add_argument('--watch', action='store_true', help='Watch a single game with board display')
     parser.add_argument('--tournament', action='store_true', help='Round-robin all bots in bots/')
+    parser.add_argument('--tier', choices=['blitz', 'fast', 'standard', 'deep'],
+                        default=None, help='Speed tier (sets BOT_TIER env var)')
 
     args = parser.parse_args()
+
+    # Set BOT_TIER env var before loading engines
+    if args.tier:
+        os.environ['BOT_TIER'] = args.tier
 
     if args.tournament:
         run_tournament(args.games)
