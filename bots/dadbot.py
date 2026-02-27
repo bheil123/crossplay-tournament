@@ -71,10 +71,10 @@ from engine.config import (
 # Calibrated for real throughput ~1600 sims/sec (8 workers under tournament load)
 TIERS = {
     'blitz': {
-        'N_CANDIDATES': 10,
-        'K_SIMS': 300,
+        'N_CANDIDATES': 7,
+        'K_SIMS': 150,
         'ES_SE_THRESHOLD': 1.5,
-        'ES_MIN_SIMS': 30,
+        'ES_MIN_SIMS': 20,
         'NEAR_ENDGAME_TIME': 3.0,
         'EXCHANGE_EVAL': False,
         'BLANK_3PLY': False,
@@ -82,10 +82,11 @@ TIERS = {
         'REAL_RISK': False,
         'BLOCKER_CANDIDATES': 0,
         'EXCHANGE_MC': False,
+        'MC_SKIP_MARGIN': 10.0,
     },
     'fast': {
-        'N_CANDIDATES': 15,
-        'K_SIMS': 600,
+        'N_CANDIDATES': 10,
+        'K_SIMS': 400,
         'ES_SE_THRESHOLD': 1.2,
         'ES_MIN_SIMS': 50,
         'NEAR_ENDGAME_TIME': 5.0,
@@ -95,6 +96,7 @@ TIERS = {
         'REAL_RISK': False,
         'BLOCKER_CANDIDATES': 3,
         'EXCHANGE_MC': False,
+        'MC_SKIP_MARGIN': 8.0,
     },
     'standard': {
         'N_CANDIDATES': 30,
@@ -1655,6 +1657,15 @@ class DadBot(BaseEngine):
             pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles,
                                               real_risk_mode=use_real_risk)
             pos_adjs.append(pos_adj)
+
+        # MC skip: if top 1-ply candidate leads by a wide margin, skip MC
+        mc_skip_margin = cfg.get('MC_SKIP_MARGIN', 0)
+        if mc_skip_margin > 0 and len(candidates) >= 2:
+            # Combine 1-ply equity + positional adj for skip comparison
+            top_eq = ranked[0][1] + pos_adjs[0] * MC_POSITIONAL_DAMPEN
+            second_eq = ranked[1][1] + pos_adjs[1] * MC_POSITIONAL_DAMPEN
+            if top_eq - second_eq >= mc_skip_margin:
+                return candidates[0][0]
 
         # Check if exchange should be considered
         best_1ply_equity = ranked[0][1] if ranked else 0
