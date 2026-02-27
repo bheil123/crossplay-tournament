@@ -275,6 +275,36 @@ The env var is a convention, not a requirement.
 - Positional heuristics (risk, blocking, DLS exposure): <25ms, always free
 - Move generation (by match runner): ~0.1-0.3s fixed cost
 
+## Reproducible games (--seed)
+
+The `--seed` flag makes games deterministic for debugging fatal errors
+or performance issues in tournament play. A master seed generates
+per-game seeds that control tile bag shuffling and all bot randomness
+that uses the global `random` module.
+
+```bash
+# Run a reproducible match
+python play_match.py dadbot my_bot --games 20 --seed 12345
+
+# Replay a specific crashed game (seed printed on crash)
+python play_match.py dadbot my_bot --watch --seed 98765
+```
+
+When a game crashes during a match, the error message prints the
+per-game seed and a ready-to-paste replay command:
+
+```
+  [CRASH] Game 11 (seed=1748302, DadBot vs MyBot): TimeoutError: ...
+  Replay: python play_match.py dadbot my_bot --watch --seed 1748302
+```
+
+`run_tourney.py` auto-generates and logs a master seed in
+`tourney_results.txt` so any tournament run can be replayed exactly.
+
+**Note:** Bots using parallel workers (e.g. DadBot with ProcessPoolExecutor)
+may not replay identically due to nondeterministic worker scheduling, but
+the board state and racks leading to the crash will be the same.
+
 ## Debugging tips
 
 - Use `--watch` to see the board after every move
@@ -282,3 +312,4 @@ The env var is a convention, not a requirement.
 - `len(moves)` tells you how many legal moves exist
 - `moves[0]['score']` is the highest possible score this turn
 - If `not moves` is True, you have no legal moves (return None to pass)
+- Use `--seed N` to replay a specific game for debugging
