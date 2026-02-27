@@ -109,7 +109,14 @@ TIERS = {
 # Fixed MC parameters (same across all tiers)
 ES_MIN_SIMS = 30            # Min sims before early stopping
 ES_CHECK_EVERY = 10         # Check convergence every N sims
-MC_WORKERS = 8              # Parallel worker count
+
+# Dynamic worker count: cpu_threads - 5 (reserve for OS, tournament runner,
+# opponent bot, DadBot main thread, headroom). Override with MC_WORKERS env var.
+_mc_workers_env = os.environ.get('MC_WORKERS')
+if _mc_workers_env:
+    MC_WORKERS = int(_mc_workers_env)
+else:
+    MC_WORKERS = max(1, os.cpu_count() - 5)  # e.g. 12 threads -> 7 workers
 
 # Exchange parameters
 EXCHANGE_EQUITY_THRESHOLD = 35.0  # consider exchange if best 1-ply < this
@@ -1270,6 +1277,8 @@ _pool = None
 def _get_pool():
     global _pool
     if _pool is None:
+        print(f"  [DadBot] MC pool: {MC_WORKERS} workers "
+              f"({os.cpu_count()} threads - 5 reserved)")
         _pool = ProcessPoolExecutor(
             max_workers=MC_WORKERS,
             initializer=_worker_init,
