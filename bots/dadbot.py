@@ -94,7 +94,7 @@ TIERS = {
         'BLANK_3PLY': False,
         'BLANK_3PLY_TIME': 0,
         'REAL_RISK': False,
-        'BLOCKER_CANDIDATES': 3,
+        'BLOCKER_CANDIDATES': 0,
         'EXCHANGE_MC': False,
         'MC_SKIP_MARGIN': 8.0,
     },
@@ -107,11 +107,9 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 8.0,
-        'REAL_RISK': True,
-        'RISK_TOP_N': 5,
-        'BLOCKER_CANDIDATES': 5,
-        'EXCHANGE_MC': True,
-        'EXCHANGE_MC_TOP': 3,
+        'REAL_RISK': False,
+        'BLOCKER_CANDIDATES': 0,
+        'EXCHANGE_MC': False,
     },
     'deep': {
         'N_CANDIDATES': 40,
@@ -122,11 +120,9 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 25.0,
-        'REAL_RISK': True,
-        'RISK_TOP_N': 8,
-        'BLOCKER_CANDIDATES': 5,
-        'EXCHANGE_MC': True,
-        'EXCHANGE_MC_TOP': 5,
+        'REAL_RISK': False,
+        'BLOCKER_CANDIDATES': 0,
+        'EXCHANGE_MC': False,
     },
 }
 
@@ -152,7 +148,7 @@ BLOCKING_CREDITS = {'3W': 15.0, '2W': 8.0, '3L': 3.0, '2L': 2.0}
 HIGH_VALUE_TILES = {'J', 'Q', 'X', 'Z', 'K'}
 HVT_PREMIUM_SCALE = 0.15
 MC_POSITIONAL_DAMPEN = 0.5
-REAL_RISK_WEIGHT = 0.7    # Dampen real risk since MC partially captures opponent response
+REAL_RISK_WEIGHT = 0.9    # Slightly dampened; MC captures some opp response but not bonus threats
 WORD_END_FACTOR = 0.7     # Reduced penalty for word-end access vs perpendicular
 
 # Blank 3-ply constants
@@ -716,10 +712,13 @@ def _compute_positional_adj(grid, move, unseen_pool, bag_size, real_risk_mode=Fa
     with actual word-based threat enumeration in the post-MC reranking step.
     """
     if real_risk_mode:
-        _, blocking = _compute_risk_and_blocking(grid, move)
+        risk, blocking = _compute_risk_and_blocking(grid, move)
+        dls = _compute_dls_exposure(grid, move, unseen_pool)
+        dd = _compute_double_double(grid, move)
         turnover = _compute_tile_turnover(move, bag_size)
         hvt = _compute_hvt_premium(grid, move)
-        return blocking + turnover + hvt
+        # Keep heuristic risk at half weight; real risk refines post-MC
+        return 0.5 * (blocking - risk + dls + dd) + turnover + hvt
     else:
         risk, blocking = _compute_risk_and_blocking(grid, move)
         dls = _compute_dls_exposure(grid, move, unseen_pool)
@@ -919,15 +918,18 @@ def _worker_eval_exchange(args):
 
     running_opp_sum = 0.0
     running_leave_sum = 0.0
+    running_eq_sum = 0.0
+    running_eq_sum_sq = 0.0
     n_sims = 0
 
     for sim_i in range(k_sims):
-        if n_sims >= es_min_sims and n_sims % es_check_every == 0 and n_sims > 0:
-            # Early stop based on total equity variance (opp + leave combined)
-            avg_so_far = (running_leave_sum - running_opp_sum) / n_sims
-            # Simple check: if we have enough sims, break
-            if n_sims >= es_min_sims * 2:
-                break
+        # Proper SE-based early stopping (same as regular MC workers)
+        if n_sims >= es_min_sims and n_sims % es_check_every == 0:
+            variance = (running_eq_sum_sq / n_sims) - (running_eq_sum / n_sims) ** 2
+            if variance > 0:
+                se = (variance / n_sims) ** 0.5
+                if se < es_se_threshold:
+                    break
 
         # Sample opponent rack
         opp_rack = ''.join(random.sample(unseen_pool, rack_draw))
@@ -959,6 +961,10 @@ def _worker_eval_exchange(args):
 
         new_leave_val = _leave_value(''.join(new_rack))
 
+        # Track combined equity for SE calculation
+        eq = new_leave_val - opp_score
+        running_eq_sum += eq
+        running_eq_sum_sq += eq * eq
         running_opp_sum += opp_score
         running_leave_sum += new_leave_val
         n_sims += 1
@@ -1743,12 +1749,18 @@ class DadBot(BaseEngine):
         best_exch_total = float('-inf')
         best_exch_result = None
         if exch_futures:
+            # Compute avg positional adj of top regular candidates as baseline
+            # penalty for exchanges (they bypass positional risk otherwise)
+            n_for_avg = min(5, len(pos_adjs))
+            avg_pos_adj = sum(pos_adjs[:n_for_avg]) / n_for_avg if n_for_avg > 0 else 0.0
+
             for future in exch_futures:
                 result = future.result(timeout=60)
                 avg_opp = result['avg_opp'] * blank_corr
                 avg_new_leave = result['avg_new_leave']
                 # Exchange equity: score 0, lose opp's response, gain new rack
-                exch_total = (0 - avg_opp) + avg_new_leave
+                # Include avg positional adj so exchanges don't bypass risk
+                exch_total = (0 - avg_opp) + avg_new_leave + avg_pos_adj * MC_POSITIONAL_DAMPEN
                 if exch_total > best_exch_total:
                     best_exch_total = exch_total
                     best_exch_result = result
@@ -1773,13 +1785,14 @@ class DadBot(BaseEngine):
         if use_real_risk and len(candidates_with_results) > 1:
             from engine.real_risk import calculate_real_risk
             unseen_counter = Counter(unseen_pool)
-            top_n = cfg.get('RISK_TOP_N', 5)
-            top_cands = sorted(candidates_with_results,
-                               key=lambda x: -x[1])[:top_n]
+            # Apply real risk to ALL candidates (not just top N) to prevent
+            # un-analyzed candidates from winning via inflated zero-risk equity
+            all_cands = sorted(candidates_with_results,
+                               key=lambda x: -x[1])
 
             rr_best_move = None
             rr_best_total = float('-inf')
-            for move, mc_total in top_cands:
+            for move, mc_total in all_cands:
                 _, exp_dmg, _, _ = calculate_real_risk(
                     board, move, unseen_counter, _dictionary,
                     BONUS_SQUARES, TILE_VALUES)
