@@ -19,13 +19,19 @@ TIERS = [
 
 
 def main():
-    # Generate a master seed for the whole tournament (reproducible on replay)
+    # Generate a master seed, then derive per-tier seeds so each tier
+    # gets independent tile draws (not correlated starting positions)
     master_seed = random.randint(0, 2**31)
+    rng = random.Random(master_seed)
+    tier_seeds = {tier: rng.randint(0, 2**31) for tier, _ in TIERS}
 
     with open(OUTPUT, "w") as f:
         f.write(f"=== DADBOT vs MYBOT TOURNAMENT ===\n")
         f.write(f"Started: {datetime.datetime.now()}\n")
-        f.write(f"Master seed: {master_seed}\n\n")
+        f.write(f"Master seed: {master_seed}\n")
+        for tier, _ in TIERS:
+            f.write(f"  {tier} seed: {tier_seeds[tier]}\n")
+        f.write(f"\n")
         f.flush()
 
         for tier, games in TIERS:
@@ -38,7 +44,7 @@ def main():
             result = subprocess.run(
                 [PYTHON, SCRIPT, "dadbot", "my_bot",
                  "--games", str(games), "--tier", tier,
-                 "--seed", str(master_seed)],
+                 "--seed", str(tier_seeds[tier])],
                 cwd=WORK_DIR,
                 stdout=f,
                 stderr=subprocess.STDOUT,
