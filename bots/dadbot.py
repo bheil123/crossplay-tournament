@@ -76,6 +76,7 @@ TIERS = {
         'EXCHANGE_EVAL': False,
         'BLANK_3PLY': False,
         'BLANK_3PLY_TIME': 0,
+        'REAL_RISK': False,
     },
     'fast': {
         'N_CANDIDATES': 15,
@@ -85,6 +86,7 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': False,
         'BLANK_3PLY_TIME': 0,
+        'REAL_RISK': False,
     },
     'standard': {
         'N_CANDIDATES': 30,
@@ -94,6 +96,8 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 8.0,
+        'REAL_RISK': True,
+        'RISK_TOP_N': 5,
     },
     'deep': {
         'N_CANDIDATES': 40,
@@ -103,6 +107,8 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 25.0,
+        'REAL_RISK': True,
+        'RISK_TOP_N': 8,
     },
 }
 
@@ -129,7 +135,8 @@ BLOCKING_CREDITS = {'3W': 15.0, '2W': 8.0, '3L': 3.0, '2L': 2.0}
 HIGH_VALUE_TILES = {'J', 'Q', 'X', 'Z', 'K'}
 HVT_PREMIUM_SCALE = 0.15
 MC_POSITIONAL_DAMPEN = 0.5
-WORD_END_FACTOR = 0.7  # Reduced penalty for word-end access vs perpendicular
+REAL_RISK_WEIGHT = 0.7    # Dampen real risk since MC partially captures opponent response
+WORD_END_FACTOR = 0.7     # Reduced penalty for word-end access vs perpendicular
 
 # Blank 3-ply constants
 BLANK_3PLY_MIN_BLANKS = 2
@@ -264,16 +271,18 @@ def _formula_leave(leave_str, bag_empty=False):
 # ---------------------------------------------------------------------------
 _gdata_bytes = None
 _word_set = None
+_dictionary = None  # Full dictionary object for real_risk
 
 
 def _ensure_resources():
-    global _gdata_bytes, _word_set
+    global _gdata_bytes, _word_set, _dictionary
     if _gdata_bytes is not None:
         return
     from engine.gaddag import get_gaddag
     _gdata_bytes = bytes(get_gaddag()._data)
     from engine.dictionary import get_dictionary
-    _word_set = get_dictionary()._words
+    _dictionary = get_dictionary()
+    _word_set = _dictionary._words
 
 
 def _get_accel():
@@ -587,8 +596,28 @@ def _compute_tile_turnover(move, bag_size):
     return min(2.0, base * bag_factor)
 
 
+CROSSWORD_BONUS_MULT = 1.8  # Premium multiplier when tile also forms a crossword
+
+
+def _has_crossword(grid, r, c, horizontal):
+    """Check if placing a tile at (r,c) forms a perpendicular word."""
+    if horizontal:
+        has_above = (r > 1 and grid[r - 2][c - 1] is not None)
+        has_below = (r < 15 and grid[r][c - 1] is not None)
+        return has_above or has_below
+    else:
+        has_left = (c > 1 and grid[r - 1][c - 2] is not None)
+        has_right = (c < 15 and grid[r - 1][c] is not None)
+        return has_left or has_right
+
+
 def _compute_hvt_premium(grid, move):
-    """Bonus for placing high-value tiles on premium squares."""
+    """Bonus for placing high-value tiles on premium squares.
+
+    When a tile also forms a perpendicular crossword, the premium square
+    bonus applies to both words -- apply CROSSWORD_BONUS_MULT to reflect
+    the additional scoring from the crossword direction.
+    """
     word = move['word']
     row, col = move['row'], move['col']
     horizontal = move['direction'] == 'H'
@@ -616,28 +645,42 @@ def _compute_hvt_premium(grid, move):
         bonus_type = BONUS_SQUARES.get((r, c))
         if not bonus_type:
             continue
+        cross = _has_crossword(grid, r, c, horizontal)
+        cmult = CROSSWORD_BONUS_MULT if cross else 1.0
+
         if bonus_type == '3L':
             if wi not in blanks_used and letter in HIGH_VALUE_TILES:
-                total_bonus += TILE_VALUES.get(letter, 0) * 2 * HVT_PREMIUM_SCALE
+                total_bonus += TILE_VALUES.get(letter, 0) * 2 * HVT_PREMIUM_SCALE * cmult
         elif bonus_type == '2L':
             if wi not in blanks_used and letter in HIGH_VALUE_TILES:
-                total_bonus += TILE_VALUES.get(letter, 0) * 1 * HVT_PREMIUM_SCALE
+                total_bonus += TILE_VALUES.get(letter, 0) * 1 * HVT_PREMIUM_SCALE * cmult
         elif bonus_type == '3W':
-            total_bonus += sum_hvt * 2 * HVT_PREMIUM_SCALE
+            total_bonus += sum_hvt * 2 * HVT_PREMIUM_SCALE * cmult
         elif bonus_type == '2W':
-            total_bonus += sum_hvt * 1 * HVT_PREMIUM_SCALE
+            total_bonus += sum_hvt * 1 * HVT_PREMIUM_SCALE * cmult
 
     return total_bonus
 
 
-def _compute_positional_adj(grid, move, unseen_pool, bag_size):
-    """Combined positional adjustment for a candidate move."""
-    risk, blocking = _compute_risk_and_blocking(grid, move)
-    dls = _compute_dls_exposure(grid, move, unseen_pool)
-    dd = _compute_double_double(grid, move)
-    turnover = _compute_tile_turnover(move, bag_size)
-    hvt = _compute_hvt_premium(grid, move)
-    return blocking - risk + dls + dd + turnover + hvt
+def _compute_positional_adj(grid, move, unseen_pool, bag_size, real_risk_mode=False):
+    """Combined positional adjustment for a candidate move.
+
+    When real_risk_mode is True (standard/deep tiers), skip the heuristic
+    risk/dls/dd penalties -- real_risk.calculate_real_risk() handles those
+    with actual word-based threat enumeration in the post-MC reranking step.
+    """
+    if real_risk_mode:
+        _, blocking = _compute_risk_and_blocking(grid, move)
+        turnover = _compute_tile_turnover(move, bag_size)
+        hvt = _compute_hvt_premium(grid, move)
+        return blocking + turnover + hvt
+    else:
+        risk, blocking = _compute_risk_and_blocking(grid, move)
+        dls = _compute_dls_exposure(grid, move, unseen_pool)
+        dd = _compute_double_double(grid, move)
+        turnover = _compute_tile_turnover(move, bag_size)
+        hvt = _compute_hvt_premium(grid, move)
+        return blocking - risk + dls + dd + turnover + hvt
 
 
 # ===================================================================
@@ -1366,9 +1409,11 @@ class DadBot(BaseEngine):
         candidates = [(m, lv) for m, eq, lv in ranked[:n_cands]]
 
         # Compute positional adjustment for each candidate (main process, <25ms)
+        use_real_risk = cfg.get('REAL_RISK', False)
         pos_adjs = []
         for move, lv in candidates:
-            pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles)
+            pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles,
+                                              real_risk_mode=use_real_risk)
             pos_adjs.append(pos_adj)
 
         # Check if exchange should be considered
@@ -1441,6 +1486,28 @@ class DadBot(BaseEngine):
                 board, rack, candidates_with_results,
                 unseen_pool, blanks_on_board, grid, bag_tiles,
                 best_move, best_total)
+
+        # Post-MC real risk reranking (STANDARD/DEEP tiers)
+        if use_real_risk and len(candidates_with_results) > 1:
+            from engine.real_risk import calculate_real_risk
+            unseen_counter = Counter(unseen_pool)
+            top_n = cfg.get('RISK_TOP_N', 5)
+            top_cands = sorted(candidates_with_results,
+                               key=lambda x: -x[1])[:top_n]
+
+            rr_best_move = None
+            rr_best_total = float('-inf')
+            for move, mc_total in top_cands:
+                _, exp_dmg, _, _ = calculate_real_risk(
+                    board, move, unseen_counter, _dictionary,
+                    BONUS_SQUARES, TILE_VALUES)
+                adjusted = mc_total - exp_dmg * REAL_RISK_WEIGHT
+                if adjusted > rr_best_total:
+                    rr_best_total = adjusted
+                    rr_best_move = move
+
+            if rr_best_move is not None:
+                best_move = rr_best_move
 
         return best_move
 
