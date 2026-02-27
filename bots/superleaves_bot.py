@@ -17,7 +17,7 @@ from bots.base_engine import BaseEngine
 # Path to the deployed SuperLeaves table
 _LEAVES_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    '..', 'crossplay', 'superleaves', 'deployed_leaves.pkl'
+    'engine', 'data', 'deployed_leaves.pkl'
 )
 
 _table = None

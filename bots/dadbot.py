@@ -209,7 +209,7 @@ HIGH_VALUE_2LETTER = {
 # SuperLeaves table (crossplay engine's trained leave values)
 # ---------------------------------------------------------------------------
 _LEAVES_PATH = os.path.normpath(os.path.join(
-    _CROSSPLAY_DIR, 'superleaves', 'deployed_leaves.pkl',
+    _TOURNAMENT_DIR, 'engine', 'data', 'deployed_leaves.pkl',
 ))
 _leaves_table = None
 
@@ -217,7 +217,7 @@ _leaves_table = None
 BINGO_WEIGHT = 0.5
 EXPECTED_BINGO_SCORE = 77.0
 _BINGO_DB_PATH = os.path.normpath(os.path.join(
-    _CROSSPLAY_DIR, 'leave_bingo_prod.pkl',
+    _TOURNAMENT_DIR, 'engine', 'data', 'leave_bingo_prod.pkl',
 ))
 _bingo_db = None
 
