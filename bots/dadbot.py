@@ -1,33 +1,34 @@
 """
-DadBot v2 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
-with positional heuristics, blank 3-ply strategy, and performance tiers.
+DadBot v3 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
+with positional heuristics, real threat analysis, and performance tiers.
 
 Uses the crossplay engine's compiled C extension (gaddag_accel.pyd) for
 blazing-fast opponent simulation with multiprocessing parallelism.
 
 Architecture:
-  - Persistent worker pool (8 workers) initialized on first pick_move()
+  - Persistent worker pool initialized on first pick_move()
   - Each worker loads GADDAG + dictionary once (30MB, cached in process)
   - Per-move: serialize grid + blank set, fan out candidates to workers
   - Each worker: reconstruct board, place candidate, create BoardContext,
     run K MC sims with early stopping, return avg_opp
   - Main process: aggregate results, add SuperLeaves + positional adj,
-    optionally run blank 3-ply check, pick best
+    optionally run blank 3-ply check, real risk reranking, pick best
 
 Evaluation modes:
   - Mid-game (bag > 8): Parallel MC 2-ply + SuperLeaves + positional adj
-    + optional blank 3-ply (STANDARD/DEEP only)
+    + blocker candidates + blank correction + bingo probability
+    + optional blank 3-ply + real risk reranking (STANDARD/DEEP)
+    + exchange MC pipeline (STANDARD/DEEP)
   - Near-endgame (bag 1-8): Hybrid -- exhaustive 3-ply for bag-emptying
     moves, parity-adjusted 1-ply for non-emptying moves
   - Endgame (bag=0): Deterministic minimax (opponent rack known exactly)
-  - Exchange: When best 1-ply equity < 35, evaluate exchange candidates
-    via MC alongside regular moves (FAST+ tiers only)
+  - Exchange: Quick screening (FAST), full MC pipeline (STANDARD/DEEP)
 
 Performance tiers (BOT_TIER env var):
-  - blitz:    ~1s/move   (N=15, K=500,  SE=1.5)
-  - fast:     ~3s/move   (N=25, K=1000, SE=1.0)  [default]
-  - standard: ~10s/move  (N=40, K=2000, SE=0.7)
-  - deep:     ~30s/move  (N=55, K=3000, SE=0.45)
+  - blitz:    ~1s/move   (N=10, K=300,  SE=1.5, min_sims=30)
+  - fast:     ~3s/move   (N=15, K=600,  SE=1.2, min_sims=50)  [default]
+  - standard: ~10s/move  (N=30, K=1500, SE=0.8, min_sims=80)
+  - deep:     ~30s/move  (N=40, K=2500, SE=0.5, min_sims=100)
 
 Falls back to sequential Python if Cython extension is unavailable.
 """
@@ -37,6 +38,7 @@ import sys
 import random
 import pickle
 import time
+from math import comb
 from collections import Counter
 from itertools import combinations
 from concurrent.futures import ProcessPoolExecutor
@@ -72,48 +74,61 @@ TIERS = {
         'N_CANDIDATES': 10,
         'K_SIMS': 300,
         'ES_SE_THRESHOLD': 1.5,
+        'ES_MIN_SIMS': 30,
         'NEAR_ENDGAME_TIME': 3.0,
         'EXCHANGE_EVAL': False,
         'BLANK_3PLY': False,
         'BLANK_3PLY_TIME': 0,
         'REAL_RISK': False,
+        'BLOCKER_CANDIDATES': 0,
+        'EXCHANGE_MC': False,
     },
     'fast': {
         'N_CANDIDATES': 15,
         'K_SIMS': 600,
         'ES_SE_THRESHOLD': 1.2,
+        'ES_MIN_SIMS': 50,
         'NEAR_ENDGAME_TIME': 5.0,
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': False,
         'BLANK_3PLY_TIME': 0,
         'REAL_RISK': False,
+        'BLOCKER_CANDIDATES': 3,
+        'EXCHANGE_MC': False,
     },
     'standard': {
         'N_CANDIDATES': 30,
         'K_SIMS': 1500,
         'ES_SE_THRESHOLD': 0.8,
+        'ES_MIN_SIMS': 80,
         'NEAR_ENDGAME_TIME': 15.0,
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 8.0,
         'REAL_RISK': True,
         'RISK_TOP_N': 5,
+        'BLOCKER_CANDIDATES': 5,
+        'EXCHANGE_MC': True,
+        'EXCHANGE_MC_TOP': 3,
     },
     'deep': {
         'N_CANDIDATES': 40,
         'K_SIMS': 2500,
         'ES_SE_THRESHOLD': 0.5,
+        'ES_MIN_SIMS': 100,
         'NEAR_ENDGAME_TIME': 15.0,
         'EXCHANGE_EVAL': True,
         'BLANK_3PLY': True,
         'BLANK_3PLY_TIME': 25.0,
         'REAL_RISK': True,
         'RISK_TOP_N': 8,
+        'BLOCKER_CANDIDATES': 5,
+        'EXCHANGE_MC': True,
+        'EXCHANGE_MC_TOP': 5,
     },
 }
 
-# Fixed MC parameters (same across all tiers)
-ES_MIN_SIMS = 30            # Min sims before early stopping
+# Fixed MC parameters
 ES_CHECK_EVERY = 10         # Check convergence every N sims
 
 # Dynamic worker count: cpu_threads - 5 (reserve for OS, tournament runner,
@@ -198,6 +213,14 @@ _LEAVES_PATH = os.path.normpath(os.path.join(
 ))
 _leaves_table = None
 
+# Bingo probability database (crossplay engine's precomputed data)
+BINGO_WEIGHT = 0.5
+EXPECTED_BINGO_SCORE = 77.0
+_BINGO_DB_PATH = os.path.normpath(os.path.join(
+    _CROSSPLAY_DIR, 'leave_bingo_prod.pkl',
+))
+_bingo_db = None
+
 
 def _load_leaves():
     global _leaves_table
@@ -209,6 +232,18 @@ def _load_leaves():
     except Exception:
         _leaves_table = {}
     return _leaves_table
+
+
+def _load_bingo_db():
+    global _bingo_db
+    if _bingo_db is not None:
+        return _bingo_db
+    try:
+        with open(_BINGO_DB_PATH, 'rb') as f:
+            _bingo_db = pickle.load(f)
+    except Exception:
+        _bingo_db = {}
+    return _bingo_db
 
 
 def _leave_value(leave_str, bag_empty=False):
@@ -225,7 +260,16 @@ def _leave_value(leave_str, bag_empty=False):
         if val is not None:
             return val
 
-    return _formula_leave(leave_str, bag_empty)
+    base = _formula_leave(leave_str, bag_empty)
+
+    # Add bingo probability bonus (only when bag has tiles and leave < 7)
+    if not bag_empty and len(leave_str) < 7:
+        bingo_db = _load_bingo_db()
+        leave_key = tuple(sorted(leave_str))
+        bingo_prob = bingo_db.get(leave_key, 0.0)
+        base += BINGO_WEIGHT * bingo_prob * EXPECTED_BINGO_SCORE
+
+    return base
 
 
 def _formula_leave(leave_str, bag_empty=False):
@@ -824,6 +868,112 @@ def _worker_eval_candidate(args):
     }
 
 
+def _worker_eval_exchange(args):
+    """Worker: MC evaluation for exchange candidate.
+
+    Board stays unchanged (exchange places no tiles). For each sim:
+    1. Sample opponent rack from unseen pool
+    2. Find opponent's best move on unchanged board
+    3. Simulate post-exchange draw (dump goes back to bag, draw replacements)
+    4. Evaluate new rack leave
+
+    Args tuple: (grid, bb_set_list, exch_info, unseen_pool, k_sims, seed,
+                  es_min_sims, es_check_every, es_se_threshold)
+    """
+    (grid, bb_set_list, exch_info, unseen_pool, k_sims, seed,
+     es_min_sims, es_check_every, es_se_threshold) = args
+
+    random.seed(seed)
+
+    from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
+    from engine.board import Board
+
+    bb_set = set(bb_set_list)
+
+    board = Board()
+    for r in range(15):
+        for c in range(15):
+            if grid[r][c] is not None:
+                board._grid[r][c] = grid[r][c]
+
+    keep_tiles = list(exch_info['keep'])
+    dump_tiles = list(exch_info['dump'])
+    draw_n = len(dump_tiles)  # Draw as many as we dump
+
+    use_cython = (_w_accel is not None and
+                  hasattr(_w_accel, 'prepare_board_context') and
+                  _w_gdata_bytes is not None)
+
+    ctx = None
+    if use_cython:
+        ctx = _w_accel.prepare_board_context(
+            board._grid, _w_gdata_bytes, bb_set,
+            _w_word_set, VALID_TWO_LETTER,
+            _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
+        )
+
+    pool_size = len(unseen_pool)
+    rack_draw = min(RACK_SIZE, pool_size)
+
+    running_opp_sum = 0.0
+    running_leave_sum = 0.0
+    n_sims = 0
+
+    for sim_i in range(k_sims):
+        if n_sims >= es_min_sims and n_sims % es_check_every == 0 and n_sims > 0:
+            # Early stop based on total equity variance (opp + leave combined)
+            avg_so_far = (running_leave_sum - running_opp_sum) / n_sims
+            # Simple check: if we have enough sims, break
+            if n_sims >= es_min_sims * 2:
+                break
+
+        # Sample opponent rack
+        opp_rack = ''.join(random.sample(unseen_pool, rack_draw))
+
+        # Opponent's best move on unchanged board
+        if use_cython:
+            opp_score, _, _, _, _ = _w_accel.find_best_score_c(ctx, opp_rack)
+        else:
+            blanks_1idx = [(r + 1, c + 1, '') for r, c in bb_set]
+            opp_moves = get_legal_moves(board, opp_rack, blanks_1idx)
+            opp_score = opp_moves[0]['score'] if opp_moves else 0
+
+        # Simulate post-exchange draw
+        # Pool = unseen - opp_rack + dump_tiles (dumped go back to bag)
+        remaining = list(unseen_pool)
+        opp_rack_list = list(opp_rack)
+        for t in opp_rack_list:
+            try:
+                remaining.remove(t)
+            except ValueError:
+                pass
+        remaining.extend(dump_tiles)
+
+        if len(remaining) >= draw_n and draw_n > 0:
+            drawn = random.sample(remaining, draw_n)
+            new_rack = keep_tiles + drawn
+        else:
+            new_rack = keep_tiles + remaining[:draw_n]
+
+        new_leave_val = _leave_value(''.join(new_rack))
+
+        running_opp_sum += opp_score
+        running_leave_sum += new_leave_val
+        n_sims += 1
+
+    avg_opp = running_opp_sum / n_sims if n_sims > 0 else 0.0
+    avg_new_leave = running_leave_sum / n_sims if n_sims > 0 else 0.0
+
+    return {
+        'is_exchange': True,
+        'keep': exch_info['keep'],
+        'dump': exch_info['dump'],
+        'avg_opp': avg_opp,
+        'avg_new_leave': avg_new_leave,
+        'n_sims': n_sims,
+    }
+
+
 # ===================================================================
 # Endgame minimax worker (bag=0, parallel)
 # ===================================================================
@@ -1280,6 +1430,83 @@ def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
 
 
 # ===================================================================
+# Blank correction factor (for MC opponent score adjustment)
+# ===================================================================
+
+def _blank_correction_factor(total_unseen, blanks_unseen):
+    """Correction multiplier for MC opponent scores when blanks are capped at 2.
+
+    Only needed when 3 blanks are unseen (Crossplay has 3 blanks).
+    Returns multiplier to apply to avg_opp (1.0 = no correction).
+    """
+    if blanks_unseen <= 2 or total_unseen < 7:
+        return 1.0
+
+    RATIO_0v2 = 0.470
+    RATIO_1v2 = 0.687
+    RATIO_3v2 = 1.036
+
+    draw = min(7, total_unseen)
+
+    def p_draw_k(k):
+        non = total_unseen - blanks_unseen
+        if k > blanks_unseen or k > draw or (draw - k) > non:
+            return 0.0
+        return comb(blanks_unseen, k) * comb(non, draw - k) / comb(total_unseen, draw)
+
+    p0 = p_draw_k(0)
+    p1 = p_draw_k(1)
+    p2 = p_draw_k(2)
+    p3 = p_draw_k(3) if blanks_unseen >= 3 else 0.0
+
+    e_true = p0 * RATIO_0v2 + p1 * RATIO_1v2 + p2 * 1.0 + p3 * RATIO_3v2
+
+    blanks_removed = blanks_unseen - 2
+    cap_total = total_unseen - blanks_removed
+    cap_blanks = 2
+    cap_draw = min(7, cap_total)
+
+    if cap_total < 1 or cap_draw < 1:
+        return 1.0
+
+    cap_non = cap_total - cap_blanks
+
+    def p_draw_k_capped(k):
+        if k > cap_blanks or k > cap_draw or (cap_draw - k) > cap_non:
+            return 0.0
+        return comb(cap_blanks, k) * comb(cap_non, cap_draw - k) / comb(cap_total, cap_draw)
+
+    cp0 = p_draw_k_capped(0)
+    cp1 = p_draw_k_capped(1)
+    cp2 = p_draw_k_capped(2)
+
+    e_capped = cp0 * RATIO_0v2 + cp1 * RATIO_1v2 + cp2 * 1.0
+
+    if e_capped <= 0:
+        return 1.0
+
+    return e_true / e_capped
+
+
+# ===================================================================
+# Blocker candidate selection
+# ===================================================================
+
+def _blocks_premium(move, grid):
+    """Check if a move covers a premium square (3W, 2W, or 3L)."""
+    row, col = move['row'], move['col']
+    horizontal = move['direction'] == 'H'
+    for i in range(len(move['word'])):
+        r = row + (0 if horizontal else i)
+        c = col + (i if horizontal else 0)
+        if 1 <= r <= 15 and 1 <= c <= 15 and grid[r - 1][c - 1] is None:
+            bonus = BONUS_SQUARES.get((r, c))
+            if bonus in ('3W', '2W', '3L'):
+                return True
+    return False
+
+
+# ===================================================================
 # Exchange evaluation
 # ===================================================================
 
@@ -1408,6 +1635,19 @@ class DadBot(BaseEngine):
         n_cands = cfg['N_CANDIDATES']
         candidates = [(m, lv) for m, eq, lv in ranked[:n_cands]]
 
+        # Add blocker candidates (moves covering premium squares)
+        max_blockers = cfg.get('BLOCKER_CANDIDATES', 0)
+        if max_blockers > 0:
+            cand_ids = {id(m) for m, _ in candidates}
+            blockers_added = 0
+            for m, eq, lv in ranked[n_cands:]:
+                if blockers_added >= max_blockers:
+                    break
+                if id(m) not in cand_ids and _blocks_premium(m, grid):
+                    candidates.append((m, lv))
+                    cand_ids.add(id(m))
+                    blockers_added += 1
+
         # Compute positional adjustment for each candidate (main process, <25ms)
         use_real_risk = cfg.get('REAL_RISK', False)
         pos_adjs = []
@@ -1418,20 +1658,17 @@ class DadBot(BaseEngine):
 
         # Check if exchange should be considered
         best_1ply_equity = ranked[0][1] if ranked else 0
-        exchange_move = None
+        exch_opts = None
         if (cfg.get('EXCHANGE_EVAL', True)
                 and best_1ply_equity < EXCHANGE_EQUITY_THRESHOLD
                 and bag_tiles >= RACK_SIZE):
             exch_opts = _generate_exchange_candidates(rack, unseen_pool)
-            if exch_opts:
-                best_exch = exch_opts[0]
-                if best_exch['expected_leave'] > best_1ply_equity:
-                    exchange_move = best_exch
 
         # Build work items for MC (with tier-specific ES params)
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
         k_sims = cfg['K_SIMS']
         es_se = cfg['ES_SE_THRESHOLD']
+        es_min = cfg.get('ES_MIN_SIMS', 30)
 
         work = []
         for i, (move, lv) in enumerate(candidates):
@@ -1446,13 +1683,28 @@ class DadBot(BaseEngine):
             }
             seed = random.randint(0, 2**31)
             work.append((grid, bb_set_list, move_data, unseen_pool,
-                         k_sims, seed, ES_MIN_SIMS, ES_CHECK_EVERY, es_se))
+                         k_sims, seed, es_min, ES_CHECK_EVERY, es_se))
+
+        # Build exchange MC work items (standard/deep only)
+        exch_work = []
+        use_exchange_mc = cfg.get('EXCHANGE_MC', False)
+        if use_exchange_mc and exch_opts:
+            exch_top = cfg.get('EXCHANGE_MC_TOP', 3)
+            for exch in exch_opts[:exch_top]:
+                seed = random.randint(0, 2**31)
+                exch_work.append((grid, bb_set_list, exch, unseen_pool,
+                                  k_sims, seed, es_min, ES_CHECK_EVERY, es_se))
 
         # Fan out to worker pool
         pool = _get_pool()
         futures = [pool.submit(_worker_eval_candidate, w) for w in work]
+        exch_futures = [pool.submit(_worker_eval_exchange, w) for w in exch_work]
 
-        # Collect results
+        # Compute blank correction factor
+        blanks_in_unseen = sum(1 for t in unseen_pool if t == '?')
+        blank_corr = _blank_correction_factor(len(unseen_pool), blanks_in_unseen)
+
+        # Collect regular move results
         best_move = None
         best_total = float('-inf')
         bag_empty_flag = bag_tiles <= RACK_SIZE
@@ -1460,7 +1712,7 @@ class DadBot(BaseEngine):
 
         for i, future in enumerate(futures):
             result = future.result(timeout=60)
-            avg_opp = result['avg_opp']
+            avg_opp = result['avg_opp'] * blank_corr  # Apply blank correction
             move, leave_val = candidates[i]
             mc_equity = move['score'] - avg_opp
 
@@ -1476,9 +1728,28 @@ class DadBot(BaseEngine):
                 best_total = total
                 best_move = move
 
-        # If exchange beats best MC move, return None (pass/exchange)
-        if exchange_move is not None and best_total < 0:
-            return None
+        # Collect exchange MC results and compete with regular moves
+        best_exch_total = float('-inf')
+        best_exch_result = None
+        if exch_futures:
+            for future in exch_futures:
+                result = future.result(timeout=60)
+                avg_opp = result['avg_opp'] * blank_corr
+                avg_new_leave = result['avg_new_leave']
+                # Exchange equity: score 0, lose opp's response, gain new rack
+                exch_total = (0 - avg_opp) + avg_new_leave
+                if exch_total > best_exch_total:
+                    best_exch_total = exch_total
+                    best_exch_result = result
+
+            # Exchange wins if it beats best regular move on total equity
+            if best_exch_result is not None and best_exch_total > best_total:
+                return None  # Signal exchange (pass/exchange)
+
+        elif exch_opts and not use_exchange_mc:
+            # Non-MC exchange path (blitz/fast): crude threshold
+            if exch_opts[0]['expected_leave'] > best_1ply_equity and best_total < 0:
+                return None
 
         # Optional blank 3-ply check (STANDARD/DEEP tiers)
         if cfg.get('BLANK_3PLY', False):
