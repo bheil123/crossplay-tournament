@@ -1419,19 +1419,21 @@ class DadBot(BaseEngine):
         return best_move
 
     def _endgame_pick(self, board, rack, moves, blanks_on_board, grid):
-        """Deterministic endgame: opponent rack known exactly. Parallel."""
+        """Deterministic endgame: opponent rack known exactly. Parallel.
+
+        Exhaustive minimax over ALL legal moves -- no pruning. Each worker
+        evaluates one move: our_score - opponent_best_response. Global time
+        budget (180s) ensures we don't hang; if time runs out, best result
+        so far is returned.
+        """
         unseen = _compute_unseen(grid, rack, blanks_on_board)
         opp_rack = ''.join(unseen)
 
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
 
-        # Limit candidates: top 60 by score (dense endgame boards can have
-        # hundreds of moves; evaluating all times out on slow hardware)
-        candidates = moves[:60]
-
-        # Build work items
+        # Evaluate ALL legal moves (exhaustive minimax)
         work = []
-        for move in candidates:
+        for move in moves:
             move_data = {
                 'word': move['word'],
                 'row': move['row'],
@@ -1448,23 +1450,34 @@ class DadBot(BaseEngine):
 
         best_move = None
         best_equity = float('-inf')
+        completed = 0
         timed_out = 0
 
+        # Global time budget: 180s for all moves
+        # (dense board: ~400 moves / 7 workers * ~2s each = ~114s typical)
+        t_start = time.perf_counter()
+        ENDGAME_BUDGET = 180.0
+
         for i, future in enumerate(futures):
+            remaining = ENDGAME_BUDGET - (time.perf_counter() - t_start)
+            if remaining <= 0:
+                timed_out += len(futures) - i
+                break
             try:
-                result = future.result(timeout=60)
+                result = future.result(timeout=max(2.0, remaining))
+                completed += 1
             except Exception:
                 timed_out += 1
                 continue
             if result['equity'] > best_equity:
                 best_equity = result['equity']
-                best_move = candidates[i]
+                best_move = moves[i]
 
         if timed_out:
-            print(f"  [DadBot] Endgame: {timed_out}/{len(futures)} "
-                  f"workers timed out")
+            print(f"  [DadBot] Endgame: {completed}/{len(futures)} evaluated, "
+                  f"{timed_out} timed out ({time.perf_counter() - t_start:.1f}s)")
 
-        # Fallback: if all timed out, play highest-scoring move
+        # Fallback: if nothing completed, play highest-scoring move
         if best_move is None:
             print("  [DadBot] Endgame: all workers failed, "
                   "falling back to top score")
