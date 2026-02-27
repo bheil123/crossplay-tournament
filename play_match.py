@@ -287,14 +287,24 @@ def find_all_bots():
 # Match modes
 # =========================================================================
 
-def run_match(engine1, engine2, num_games, watch=False, master_seed=None):
-    """Run a match (series of games) between two engines."""
-    # Generate per-game seeds from master seed (or random if none)
-    if master_seed is not None:
-        rng = random.Random(master_seed)
+def run_match(engine1, engine2, num_games, watch=False, master_seed=None,
+              game_seeds=None):
+    """Run a match (series of games) between two engines.
+
+    game_seeds: optional list of pre-assigned per-game seeds (one per game).
+                When provided, overrides master_seed for seed generation.
+    """
+    if game_seeds is not None:
+        # Pre-assigned seeds from tournament runner -- use directly
+        assert len(game_seeds) == num_games, (
+            f"Expected {num_games} seeds, got {len(game_seeds)}")
     else:
-        rng = random.Random()
-    game_seeds = [rng.randint(0, 2**31) for _ in range(num_games)]
+        # Generate per-game seeds from master seed (or random if none)
+        if master_seed is not None:
+            rng = random.Random(master_seed)
+        else:
+            rng = random.Random()
+        game_seeds = [rng.randint(0, 2**31) for _ in range(num_games)]
 
     if watch:
         # Single game in watch mode
@@ -522,6 +532,8 @@ def main():
                         default=None, help='Speed tier (sets BOT_TIER env var)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Master seed for reproducible games (per-game seeds derived from this)')
+    parser.add_argument('--game-seeds', type=str, default=None,
+                        help='Comma-separated per-game seeds (overrides --seed)')
 
     args = parser.parse_args()
 
@@ -529,12 +541,18 @@ def main():
     if args.tier:
         os.environ['BOT_TIER'] = args.tier
 
+    # Parse pre-assigned per-game seeds (from run_tourney.py)
+    game_seeds_list = None
+    if args.game_seeds:
+        game_seeds_list = [int(s) for s in args.game_seeds.split(',')]
+
     if args.tournament:
         run_tournament(args.games, master_seed=args.seed)
     elif args.engine1 and args.engine2:
         e1 = load_engine(args.engine1)
         e2 = load_engine(args.engine2)
-        run_match(e1, e2, args.games, watch=args.watch, master_seed=args.seed)
+        run_match(e1, e2, args.games, watch=args.watch,
+                  master_seed=args.seed, game_seeds=game_seeds_list)
     else:
         parser.print_help()
         print("\nExamples:")

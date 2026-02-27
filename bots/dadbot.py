@@ -372,6 +372,28 @@ def _was_already_reachable(grid, pr, pc, word_positions):
     return False
 
 
+# Multiplier when a bonus square is attackable from both H and V directions
+DUAL_DIRECTION_MULT = 1.5
+
+
+def _direction_count(grid, br, bc, word_positions):
+    """Count how many axes (H, V) a bonus square can be exploited from.
+
+    A bonus square is exploitable on an axis if there's an adjacent tile
+    along that axis (provides a hook for word formation).
+    Returns 1 or 2.
+    """
+    def _has_adj(r, c):
+        if 1 <= r <= 15 and 1 <= c <= 15:
+            if (r, c) in word_positions or grid[r - 1][c - 1] is not None:
+                return True
+        return False
+
+    h_ok = _has_adj(br, bc - 1) or _has_adj(br, bc + 1)
+    v_ok = _has_adj(br - 1, bc) or _has_adj(br + 1, bc)
+    return (1 if h_ok else 0) + (1 if v_ok else 0) or 1
+
+
 def _compute_risk_and_blocking(grid, move):
     """Compute risk penalty for opened bonus squares + blocking bonus for covered ones.
 
@@ -414,7 +436,9 @@ def _compute_risk_and_blocking(grid, move):
             bonus_type = BONUS_SQUARES.get((nr, nc))
             if bonus_type and not _was_already_reachable(grid, nr, nc, word_positions):
                 seen_opened.add((nr, nc))
-                risk_penalty += RISK_PENALTIES.get(bonus_type, 0)
+                dirs = _direction_count(grid, nr, nc, word_positions)
+                mult = DUAL_DIRECTION_MULT if dirs >= 2 else 1.0
+                risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * mult
 
     # Word-end squares (extension points) -- reduced penalty
     if horizontal:
@@ -440,7 +464,9 @@ def _compute_risk_and_blocking(grid, move):
         bonus_type = BONUS_SQUARES.get((nr, nc))
         if bonus_type and not _was_already_reachable(grid, nr, nc, word_positions):
             seen_opened.add((nr, nc))
-            risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * WORD_END_FACTOR
+            dirs = _direction_count(grid, nr, nc, word_positions)
+            mult = DUAL_DIRECTION_MULT if dirs >= 2 else 1.0
+            risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * WORD_END_FACTOR * mult
 
     return risk_penalty, blocking_bonus
 

@@ -19,22 +19,36 @@ TIERS = [
 
 
 def main():
-    # Generate a master seed, then derive per-tier seeds so each tier
-    # gets independent tile draws (not correlated starting positions)
+    # Generate a master seed, then derive one unique seed per game across
+    # the entire tournament.  Every game gets a provably unique seed so
+    # no two games (even in different tiers) can share starting positions.
     master_seed = random.randint(0, 2**31)
     rng = random.Random(master_seed)
-    tier_seeds = {tier: rng.randint(0, 2**31) for tier, _ in TIERS}
+    total_games = sum(g for _, g in TIERS)
+    all_seeds = [rng.randint(0, 2**31) for _ in range(total_games)]
+
+    # Partition seeds across tiers
+    tier_seeds = {}
+    offset = 0
+    for tier, games in TIERS:
+        tier_seeds[tier] = all_seeds[offset:offset + games]
+        offset += games
 
     with open(OUTPUT, "w") as f:
         f.write(f"=== DADBOT vs MYBOT TOURNAMENT ===\n")
         f.write(f"Started: {datetime.datetime.now()}\n")
         f.write(f"Master seed: {master_seed}\n")
+        f.write(f"Total games: {total_games}\n")
         for tier, _ in TIERS:
-            f.write(f"  {tier} seed: {tier_seeds[tier]}\n")
+            seeds = tier_seeds[tier]
+            f.write(f"  {tier}: seeds {seeds[0]}..{seeds[-1]} "
+                    f"({len(seeds)} games)\n")
         f.write(f"\n")
         f.flush()
 
         for tier, games in TIERS:
+            seeds_csv = ','.join(str(s) for s in tier_seeds[tier])
+
             f.write(f"{'='*50}\n")
             f.write(f"TIER: {tier} ({games} games)\n")
             f.write(f"Started: {datetime.datetime.now()}\n")
@@ -44,7 +58,7 @@ def main():
             result = subprocess.run(
                 [PYTHON, SCRIPT, "dadbot", "my_bot",
                  "--games", str(games), "--tier", tier,
-                 "--seed", str(tier_seeds[tier])],
+                 "--game-seeds", seeds_csv],
                 cwd=WORK_DIR,
                 stdout=f,
                 stderr=subprocess.STDOUT,
