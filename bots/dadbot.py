@@ -749,6 +749,206 @@ def _worker_eval_candidate(args):
 
 
 # ===================================================================
+# Endgame minimax worker (bag=0, parallel)
+# ===================================================================
+
+def _worker_eval_endgame(args):
+    """Worker: deterministic minimax for one move when bag=0.
+
+    Opponent rack is known exactly (unseen tiles = their rack).
+    Evaluates: our_score - opponent_best_response.
+
+    Args tuple: (grid, bb_set_list, move, opp_rack)
+    """
+    grid, bb_set_list, move, opp_rack = args
+
+    from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
+    from engine.board import Board
+
+    bb_set = set(bb_set_list)
+
+    board = Board()
+    for r in range(15):
+        for c in range(15):
+            if grid[r][c] is not None:
+                board._grid[r][c] = grid[r][c]
+
+    horizontal = move['direction'] == 'H'
+    placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
+
+    # Update blank set with blanks from this move
+    move_bb = set(bb_set)
+    for bi in move.get('blanks_used', []):
+        if horizontal:
+            move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
+        else:
+            move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
+
+    # Find opponent's best response
+    use_cython = (_w_accel is not None and
+                  hasattr(_w_accel, 'prepare_board_context') and
+                  _w_gdata_bytes is not None)
+
+    if use_cython:
+        ctx = _w_accel.prepare_board_context(
+            board._grid, _w_gdata_bytes, move_bb,
+            _w_word_set, VALID_TWO_LETTER,
+            _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
+        )
+        opp_score, _, _, _, _ = _w_accel.find_best_score_c(ctx, opp_rack)
+    else:
+        blanks_1idx = [(r + 1, c + 1, '') for r, c in move_bb]
+        opp_moves = get_legal_moves(board, opp_rack, blanks_1idx)
+        opp_score = opp_moves[0]['score'] if opp_moves else 0
+
+    board.undo_move(placed)
+    equity = move['score'] - opp_score
+
+    return {
+        'word': move['word'],
+        'row': move['row'],
+        'col': move['col'],
+        'direction': move['direction'],
+        'score': move['score'],
+        'equity': equity,
+    }
+
+
+# ===================================================================
+# Near-endgame worker (bag 1-8, parallel exhaustive 3-ply)
+# ===================================================================
+
+def _worker_eval_near_endgame(args):
+    """Worker: exhaustive 3-ply for one bag-emptying move.
+
+    Iterates over all C(unseen, rack_size) opponent rack combinations.
+    For each: our_score - opp_best_response + our_follow_up.
+
+    Args tuple: (grid, bb_set_list, move, unseen_pool, rack)
+    """
+    grid, bb_set_list, move, unseen_pool, rack = args
+
+    from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
+    from engine.board import Board
+
+    bb_set = set(bb_set_list)
+
+    board = Board()
+    for r in range(15):
+        for c in range(15):
+            if grid[r][c] is not None:
+                board._grid[r][c] = grid[r][c]
+
+    # Place our move (ply 1)
+    horizontal = move['direction'] == 'H'
+    placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
+
+    move_bb = set(bb_set)
+    for bi in move.get('blanks_used', []):
+        if horizontal:
+            move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
+        else:
+            move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
+
+    # Compute our leave (tiles remaining after playing this move)
+    tiles_used = move.get('tiles_used', list(move['word']))
+    rack_list = list(rack.upper())
+    for t in tiles_used:
+        if t in rack_list:
+            rack_list.remove(t)
+        elif '?' in rack_list:
+            rack_list.remove('?')
+    your_leave = ''.join(rack_list)
+
+    use_cython = (_w_accel is not None and
+                  hasattr(_w_accel, 'prepare_board_context') and
+                  _w_gdata_bytes is not None)
+
+    # Prepare board context for opponent response (ply 2)
+    ctx_ply2 = None
+    if use_cython:
+        ctx_ply2 = _w_accel.prepare_board_context(
+            board._grid, _w_gdata_bytes, move_bb,
+            _w_word_set, VALID_TWO_LETTER,
+            _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
+        )
+
+    unseen_str_list = list(unseen_pool)
+    unseen_count = len(unseen_pool)
+    opp_rack_size = min(RACK_SIZE, unseen_count)
+    net_scores = []
+
+    for combo_indices in combinations(range(unseen_count), opp_rack_size):
+        opp_rack = ''.join(unseen_str_list[i] for i in combo_indices)
+        drawn_indices = set(range(unseen_count)) - set(combo_indices)
+        drawn_tiles = ''.join(unseen_str_list[i] for i in drawn_indices)
+        your_full_rack = your_leave + drawn_tiles
+
+        # Ply 2: opponent's best response
+        if use_cython:
+            opp_score, opp_word, opp_r, opp_c, opp_d = _w_accel.find_best_score_c(
+                ctx_ply2, opp_rack)
+        else:
+            opp_score = 0
+            opp_ms = get_legal_moves(board, opp_rack,
+                                     [(r + 1, c + 1, '') for r, c in move_bb])
+            if opp_ms:
+                opp_score = opp_ms[0]['score']
+                opp_word = opp_ms[0]['word']
+                opp_r = opp_ms[0]['row']
+                opp_c = opp_ms[0]['col']
+                opp_d = opp_ms[0]['direction']
+
+        # Ply 3: our follow-up after opponent's move
+        your_resp_score = 0
+        if opp_score > 0:
+            opp_horiz = opp_d == 'H' if isinstance(opp_d, str) else opp_d
+            placed_2 = board.place_move(opp_word, opp_r, opp_c, opp_horiz)
+
+            if use_cython:
+                ctx_ply3 = _w_accel.prepare_board_context(
+                    board._grid, _w_gdata_bytes, move_bb,
+                    _w_word_set, VALID_TWO_LETTER,
+                    _w_tv, _w_bonus, BINGO_BONUS, RACK_SIZE,
+                )
+                your_resp_score, _, _, _, _ = _w_accel.find_best_score_c(
+                    ctx_ply3, your_full_rack)
+            else:
+                resp_ms = get_legal_moves(board, your_full_rack,
+                                          [(r + 1, c + 1, '') for r, c in move_bb])
+                if resp_ms:
+                    your_resp_score = resp_ms[0]['score']
+
+            board.undo_move(placed_2)
+        else:
+            # Opponent passed -- use ply2 board state
+            if use_cython:
+                your_resp_score, _, _, _, _ = _w_accel.find_best_score_c(
+                    ctx_ply2, your_full_rack)
+            else:
+                resp_ms = get_legal_moves(board, your_full_rack,
+                                          [(r + 1, c + 1, '') for r, c in move_bb])
+                if resp_ms:
+                    your_resp_score = resp_ms[0]['score']
+
+        net = move['score'] - opp_score + your_resp_score
+        net_scores.append(net)
+
+    board.undo_move(placed)
+
+    avg_net = sum(net_scores) / len(net_scores) if net_scores else float(move['score'])
+
+    return {
+        'word': move['word'],
+        'row': move['row'],
+        'col': move['col'],
+        'direction': move['direction'],
+        'score': move['score'],
+        'avg_equity': avg_net,
+    }
+
+
+# ===================================================================
 # Blank 3-ply worker (STANDARD/DEEP only)
 # ===================================================================
 
@@ -925,27 +1125,23 @@ def _worker_eval_3ply_blank(args):
 
 def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
                            time_budget=15.0):
-    """Hybrid evaluation for bag 1-8.
+    """Hybrid evaluation for bag 1-8. Parallel.
 
-    Bag-emptying moves: exhaustive 3-ply over all C(unseen,7) opponent racks.
-    Non-emptying moves: parity-adjusted 1-ply equity.
+    Bag-emptying moves: parallel exhaustive 3-ply via worker pool.
+    Non-emptying moves: parity-adjusted 1-ply equity (instant, main process).
 
     Returns best move.
     """
-    _ensure_resources()
-    accel = _get_accel()
-    use_cython = (accel is not None and hasattr(accel, 'prepare_board_context')
-                  and _gdata_bytes is not None)
-
     unseen_count = len(unseen_pool)
     bag_size = max(0, unseen_count - RACK_SIZE)
-    bb_set = {(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])}
 
     results = []
-    t_start = time.perf_counter()
 
     ranked = _rank_by_equity(moves, bag_size)
     candidates = ranked[:25]
+
+    bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
+    grid = [row[:] for row in board._grid]
 
     # PASS 1: non-emptying moves (instant -- parity-adjusted 1-ply)
     exhaust_cands = []
@@ -965,99 +1161,40 @@ def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
 
             results.append((move, equity_1ply + parity_penalty))
 
-    # PASS 2: bag-emptying moves -- exhaustive 3-ply
-    unseen_str_list = list(unseen_pool)
-    for move, equity_1ply, leave_val in exhaust_cands:
-        elapsed = time.perf_counter() - t_start
-        if elapsed > time_budget:
-            results.append((move, equity_1ply))
-            continue
+    # PASS 2: bag-emptying moves -- parallel exhaustive 3-ply via workers
+    if exhaust_cands:
+        work = []
+        for move, equity_1ply, leave_val in exhaust_cands:
+            move_data = {
+                'word': move['word'],
+                'row': move['row'],
+                'col': move['col'],
+                'direction': move['direction'],
+                'score': move['score'],
+                'blanks_used': move.get('blanks_used', []),
+                'tiles_used': move.get('tiles_used', list(move['word'])),
+            }
+            work.append((grid, bb_set_list, move_data, unseen_pool, rack))
 
-        rack_list = list(rack.upper())
-        tiles_used = move.get('tiles_used', [])
-        for t in tiles_used:
-            if t in rack_list:
-                rack_list.remove(t)
-            elif '?' in rack_list:
-                rack_list.remove('?')
-        your_leave = ''.join(rack_list)
+        pool = _get_pool()
+        futures = [pool.submit(_worker_eval_near_endgame, w) for w in work]
 
-        horizontal = move['direction'] == 'H'
-        placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
-
-        move_bb = set(bb_set)
-        for bi in move.get('blanks_used', []):
-            if horizontal:
-                move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
-            else:
-                move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
-
-        ctx = None
-        if use_cython:
-            ctx = accel.prepare_board_context(
-                board._grid, _gdata_bytes, move_bb,
-                _word_set, VALID_TWO_LETTER,
-                _TV, _BONUS, BINGO_BONUS, RACK_SIZE,
-            )
-
-        opp_rack_size = min(RACK_SIZE, unseen_count)
-        net_scores = []
-
-        for combo_indices in combinations(range(unseen_count), opp_rack_size):
-            opp_rack = ''.join(unseen_str_list[i] for i in combo_indices)
-            drawn_indices = set(range(unseen_count)) - set(combo_indices)
-            drawn_tiles = ''.join(unseen_str_list[i] for i in drawn_indices)
-            your_full_rack = your_leave + drawn_tiles
-
-            if use_cython:
-                opp_score, opp_word, opp_r, opp_c, opp_d = accel.find_best_score_c(ctx, opp_rack)
-            else:
-                opp_score = 0
-                opp_ms = get_legal_moves(board, opp_rack, blanks_on_board)
-                if opp_ms:
-                    opp_score = opp_ms[0]['score']
-                    opp_word = opp_ms[0]['word']
-                    opp_r = opp_ms[0]['row']
-                    opp_c = opp_ms[0]['col']
-                    opp_d = opp_ms[0]['direction']
-
-            your_resp_score = 0
-            if opp_score > 0:
-                opp_horiz = opp_d == 'H'
-                placed_2 = board.place_move(opp_word, opp_r, opp_c, opp_horiz)
-
-                if use_cython:
-                    ctx3 = accel.prepare_board_context(
-                        board._grid, _gdata_bytes, move_bb,
-                        _word_set, VALID_TWO_LETTER,
-                        _TV, _BONUS, BINGO_BONUS, RACK_SIZE,
-                    )
-                    your_resp_score, _, _, _, _ = accel.find_best_score_c(ctx3, your_full_rack)
-                else:
-                    resp_ms = get_legal_moves(board, your_full_rack, blanks_on_board)
-                    if resp_ms:
-                        your_resp_score = resp_ms[0]['score']
-
-                board.undo_move(placed_2)
-            else:
-                if use_cython:
-                    your_resp_score, _, _, _, _ = accel.find_best_score_c(ctx, your_full_rack)
-                else:
-                    resp_ms = get_legal_moves(board, your_full_rack, blanks_on_board)
-                    if resp_ms:
-                        your_resp_score = resp_ms[0]['score']
-
-            net = move['score'] - opp_score + your_resp_score
-            net_scores.append(net)
-
-        board.undo_move(placed)
-
-        if net_scores:
-            avg_net = sum(net_scores) / len(net_scores)
-        else:
-            avg_net = float(move['score'])
-
-        results.append((move, avg_net))
+        t_start = time.perf_counter()
+        for i, future in enumerate(futures):
+            remaining = time_budget - (time.perf_counter() - t_start)
+            if remaining <= 0:
+                # Time's up -- use 1-ply fallback for remaining candidates
+                move, equity_1ply, _ = exhaust_cands[i]
+                results.append((move, equity_1ply))
+                continue
+            try:
+                result = future.result(timeout=max(1, remaining))
+                # Find the original move object for this result
+                orig_move = exhaust_cands[i][0]
+                results.append((orig_move, result['avg_equity']))
+            except Exception:
+                move, equity_1ply, _ = exhaust_cands[i]
+                results.append((move, equity_1ply))
 
     if not results:
         return moves[0] if moves else None
@@ -1273,46 +1410,37 @@ class DadBot(BaseEngine):
         return best_move
 
     def _endgame_pick(self, board, rack, moves, blanks_on_board, grid):
-        """Deterministic endgame: opponent rack known exactly."""
+        """Deterministic endgame: opponent rack known exactly. Parallel."""
         unseen = _compute_unseen(grid, rack, blanks_on_board)
         opp_rack = ''.join(unseen)
-        accel = _get_accel()
+
+        bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
+
+        # Build work items for all moves
+        work = []
+        for move in moves:
+            move_data = {
+                'word': move['word'],
+                'row': move['row'],
+                'col': move['col'],
+                'direction': move['direction'],
+                'score': move['score'],
+                'blanks_used': move.get('blanks_used', []),
+            }
+            work.append((grid, bb_set_list, move_data, opp_rack))
+
+        # Fan out to worker pool
+        pool = _get_pool()
+        futures = [pool.submit(_worker_eval_endgame, w) for w in work]
 
         best_move = None
         best_equity = float('-inf')
 
-        bb_set = {(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])}
-
-        for move in moves:
-            horizontal = move['direction'] == 'H'
-            placed = board.place_move(
-                move['word'], move['row'], move['col'], horizontal)
-
-            move_bb = set(bb_set)
-            for bi in move.get('blanks_used', []):
-                if horizontal:
-                    move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
-                else:
-                    move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
-
-            if accel and hasattr(accel, 'prepare_board_context'):
-                ctx = accel.prepare_board_context(
-                    board._grid, _gdata_bytes, move_bb,
-                    _word_set, VALID_TWO_LETTER,
-                    _TV, _BONUS, BINGO_BONUS, RACK_SIZE,
-                )
-                opp_score, _, _, _, _ = accel.find_best_score_c(ctx, opp_rack)
-            else:
-                opp_score = 0
-                opp_moves = get_legal_moves(board, opp_rack, blanks_on_board)
-                if opp_moves:
-                    opp_score = opp_moves[0]['score']
-
-            board.undo_move(placed)
-            equity = move['score'] - opp_score
-            if equity > best_equity:
-                best_equity = equity
-                best_move = move
+        for i, future in enumerate(futures):
+            result = future.result(timeout=30)
+            if result['equity'] > best_equity:
+                best_equity = result['equity']
+                best_move = moves[i]
 
         return best_move
 
