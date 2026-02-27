@@ -1425,9 +1425,13 @@ class DadBot(BaseEngine):
 
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
 
-        # Build work items for all moves
+        # Limit candidates: top 60 by score (dense endgame boards can have
+        # hundreds of moves; evaluating all times out on slow hardware)
+        candidates = moves[:60]
+
+        # Build work items
         work = []
-        for move in moves:
+        for move in candidates:
             move_data = {
                 'word': move['word'],
                 'row': move['row'],
@@ -1444,12 +1448,27 @@ class DadBot(BaseEngine):
 
         best_move = None
         best_equity = float('-inf')
+        timed_out = 0
 
         for i, future in enumerate(futures):
-            result = future.result(timeout=30)
+            try:
+                result = future.result(timeout=60)
+            except Exception:
+                timed_out += 1
+                continue
             if result['equity'] > best_equity:
                 best_equity = result['equity']
-                best_move = moves[i]
+                best_move = candidates[i]
+
+        if timed_out:
+            print(f"  [DadBot] Endgame: {timed_out}/{len(futures)} "
+                  f"workers timed out")
+
+        # Fallback: if all timed out, play highest-scoring move
+        if best_move is None:
+            print("  [DadBot] Endgame: all workers failed, "
+                  "falling back to top score")
+            best_move = moves[0]
 
         return best_move
 
