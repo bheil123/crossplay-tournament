@@ -1,6 +1,6 @@
 """
-DadBot v4 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
-with risk heuristics and performance tiers.
+DadBot v5 -- Parallel Cython-accelerated Monte Carlo 2-ply evaluation
+with performance tiers.
 
 Uses the crossplay engine's compiled C extension (gaddag_accel.pyd) for
 blazing-fast opponent simulation with multiprocessing parallelism.
@@ -11,12 +11,10 @@ Architecture:
   - Per-move: serialize grid + blank set, fan out candidates to workers
   - Each worker: reconstruct board, place candidate, create BoardContext,
     run K MC sims with early stopping, return avg_opp
-  - Main process: aggregate results, add SuperLeaves + positional adj,
-    pick best
+  - Main process: aggregate results, add leave value, pick best
 
 Evaluation modes:
-  - Mid-game (bag > 8): Parallel MC 2-ply + SuperLeaves + positional adj
-    + blank correction + bingo probability + exchange screening
+  - Mid-game (bag > 8): Parallel MC 2-ply + leave formula
   - Near-endgame (bag 1-8): Hybrid -- exhaustive 3-ply for bag-emptying
     moves, parity-adjusted 1-ply for non-emptying moves
   - Endgame (bag=0): Deterministic minimax (opponent rack known exactly)
@@ -33,14 +31,17 @@ Falls back to sequential Python if Cython extension is unavailable.
 import os
 import sys
 import random
-import pickle
 import time
-from math import comb
-from collections import Counter
 from itertools import combinations
 from concurrent.futures import ProcessPoolExecutor
 
 from bots.base_engine import BaseEngine, get_legal_moves
+
+# Private RNG for DadBot internals (MC seeds, exchange sampling).
+# CRITICAL: using the global random module would contaminate the game's tile
+# draw sequence, making outcomes depend on N_CANDIDATES and K_SIMS rather than
+# just the game seed. This private instance isolates DadBot's randomness.
+_rng = random.Random(42)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -73,7 +74,6 @@ TIERS = {
         'ES_SE_THRESHOLD': 1.5,
         'ES_MIN_SIMS': 20,
         'NEAR_ENDGAME_TIME': 3.0,
-        'EXCHANGE_EVAL': False,
         'MC_SKIP_MARGIN': 10.0,
     },
     'fast': {
@@ -82,7 +82,6 @@ TIERS = {
         'ES_SE_THRESHOLD': 1.2,
         'ES_MIN_SIMS': 50,
         'NEAR_ENDGAME_TIME': 5.0,
-        'EXCHANGE_EVAL': True,
         'MC_SKIP_MARGIN': 8.0,
     },
     'standard': {
@@ -91,7 +90,6 @@ TIERS = {
         'ES_SE_THRESHOLD': 0.8,
         'ES_MIN_SIMS': 80,
         'NEAR_ENDGAME_TIME': 15.0,
-        'EXCHANGE_EVAL': True,
     },
     'deep': {
         'N_CANDIDATES': 35,
@@ -99,7 +97,6 @@ TIERS = {
         'ES_SE_THRESHOLD': 0.5,
         'ES_MIN_SIMS': 100,
         'NEAR_ENDGAME_TIME': 15.0,
-        'EXCHANGE_EVAL': True,
     },
 }
 
@@ -115,17 +112,53 @@ if _mc_workers_env:
 else:
     MC_WORKERS = max(1, os.cpu_count() - 3)  # e.g. 12 threads -> 9 workers
 
-# Exchange parameters
-EXCHANGE_EQUITY_THRESHOLD = 35.0  # consider exchange if best 1-ply < this
-EXCHANGE_TOP_CANDIDATES = 5       # exchange options to evaluate
-EXCHANGE_QUICK_MC = 200           # quick MC sims per exchange option
+# ---------------------------------------------------------------------------
+# Optional overrides for N/K tuning (env vars)
+# ---------------------------------------------------------------------------
+_DADBOT_N = os.environ.get('DADBOT_N')           # Override N_CANDIDATES
+_DADBOT_K = os.environ.get('DADBOT_K')           # Override K_SIMS
 
-# Positional evaluation constants
-RISK_PENALTIES = {'3W': 8.0, '2W': 3.0, '3L': 1.5, '2L': 0.5}
-MC_POSITIONAL_DAMPEN = 0.5
+# Print active overrides at import time
+_overrides = []
+if _DADBOT_N: _overrides.append(f'N={_DADBOT_N}')
+if _DADBOT_K: _overrides.append(f'K={_DADBOT_K}')
+if _overrides:
+    print(f'  [DadBot] Overrides: {", ".join(_overrides)}')
 
-# Multiplier when a bonus square is attackable from both H and V directions
-DUAL_DIRECTION_MULT = 1.5
+# MyBot's leave formula (for A/B testing SuperLeaves vs simple formula)
+_MYBOT_TILE_VALUES = {
+    '?': 20.0, 'S': 7.0, 'Z': 5.12, 'X': 3.31, 'R': 1.10, 'H': 0.60,
+    'C': 0.85, 'M': 0.58, 'D': 0.45, 'E': 0.35, 'N': 0.22, 'T': -0.10,
+    'L': 0.20, 'P': -0.46, 'K': -0.20, 'Y': -0.63, 'A': -0.63, 'J': -0.80,
+    'B': -1.50, 'I': -2.07, 'F': -2.21, 'O': -2.50, 'G': -1.80, 'W': -4.50,
+    'U': -4.00, 'V': -6.50, 'Q': -6.79,
+}
+
+def _mybot_leave_decay(tiles_in_bag):
+    if tiles_in_bag >= 30:
+        return 1.0
+    elif tiles_in_bag >= 15:
+        return 0.70
+    elif tiles_in_bag >= 7:
+        return 0.40
+    else:
+        return 0.10
+
+def _mybot_leave_value(leave_str, bag_tiles=100):
+    """MyBot's simple 26-char leave formula (for bisection testing)."""
+    if not leave_str or leave_str == '-':
+        return 0.0
+    leave = leave_str.upper()
+    value = sum(_MYBOT_TILE_VALUES.get(t, -1.0) for t in leave)
+    vowels = sum(1 for t in leave if t in 'AEIOU')
+    consonants = sum(1 for t in leave if t.isalpha() and t not in 'AEIOU' and t != '?')
+    if len(leave) >= 2:
+        if vowels == 1 and consonants >= 1:
+            value += 2.0
+        elif vowels >= 2 and consonants == 0:
+            value -= 5.0
+    value *= _mybot_leave_decay(bag_tiles)
+    return value
 
 # Bag parity penalty table (from crossplay engine)
 _PARITY_P_OPP_EMPTIES = {
@@ -152,130 +185,21 @@ for (_r1, _c1), _btype in BONUS_SQUARES.items():
     elif _btype == '3W':
         _BONUS[_r0][_c0] = (1, 3)
 
-# Pre-computed bonus square sets (1-indexed)
-DLS_POSITIONS = frozenset((r, c) for (r, c), v in BONUS_SQUARES.items() if v == '2L')
-
-# Hookability: how many 2-letter words can each letter form?
-HOOKABILITY = {
-    'A': 28, 'B': 6, 'C': 0, 'D': 7, 'E': 24, 'F': 5, 'G': 3, 'H': 10,
-    'I': 18, 'J': 1, 'K': 3, 'L': 5, 'M': 12, 'N': 9, 'O': 27, 'P': 6,
-    'Q': 1, 'R': 4, 'S': 8, 'T': 8, 'U': 9, 'V': 0, 'W': 5, 'X': 5,
-    'Y': 7, 'Z': 1,
-}
-
-# High-value tiles and their 2-letter words (for DLS exposure)
-HIGH_VALUE_2LETTER = {
-    'J': ['JO'],
-    'Q': ['QI'],
-    'Z': ['ZA'],
-    'X': ['AX', 'EX', 'OX', 'XI', 'XU'],
-    'K': ['KA', 'KI', 'OK'],
-}
 
 
 # ---------------------------------------------------------------------------
-# SuperLeaves table (crossplay engine's trained leave values)
+# Leave evaluation -- bag-decay weighted tile value formula
 # ---------------------------------------------------------------------------
-_LEAVES_PATH = os.path.normpath(os.path.join(
-    _TOURNAMENT_DIR, 'engine', 'data', 'deployed_leaves.pkl',
-))
-_leaves_table = None
+# Replaces SuperLeaves (921K trained table). The trained table was built on a
+# buggy engine (pre-V16 move finder fix) and has systematic biases that cause
+# move quality to DEGRADE as N_CANDIDATES increases. The simple 26-char formula
+# scales cleanly with N and slightly outperforms SuperLeaves at all tier levels.
+# TODO: Retrain SuperLeaves on V20 engine and re-evaluate.
+# ---------------------------------------------------------------------------
 
-# Bingo probability database (crossplay engine's precomputed data)
-BINGO_WEIGHT = 0.5
-EXPECTED_BINGO_SCORE = 77.0
-_BINGO_DB_PATH = os.path.normpath(os.path.join(
-    _TOURNAMENT_DIR, 'engine', 'data', 'leave_bingo_prod.pkl',
-))
-_bingo_db = None
-
-
-def _load_leaves():
-    global _leaves_table
-    if _leaves_table is not None:
-        return _leaves_table
-    try:
-        with open(_LEAVES_PATH, 'rb') as f:
-            _leaves_table = pickle.load(f)
-    except Exception:
-        _leaves_table = {}
-    return _leaves_table
-
-
-def _load_bingo_db():
-    global _bingo_db
-    if _bingo_db is not None:
-        return _bingo_db
-    try:
-        with open(_BINGO_DB_PATH, 'rb') as f:
-            _bingo_db = pickle.load(f)
-    except Exception:
-        _bingo_db = {}
-    return _bingo_db
-
-
-def _leave_value(leave_str, bag_empty=False):
-    """Evaluate leave quality using SuperLeaves (mid-game) or formula (endgame)."""
-    if not leave_str or leave_str == '-':
-        return 0.0
-
-    leave_str = leave_str.upper()
-
-    if not bag_empty:
-        table = _load_leaves()
-        key = tuple(sorted(leave_str))
-        val = table.get(key)
-        if val is not None:
-            return val
-
-    base = _formula_leave(leave_str, bag_empty)
-
-    # Add bingo probability bonus (only when bag has tiles and leave < 7)
-    if not bag_empty and len(leave_str) < 7:
-        bingo_db = _load_bingo_db()
-        leave_key = tuple(sorted(leave_str))
-        bingo_prob = bingo_db.get(leave_key, 0.0)
-        base += BINGO_WEIGHT * bingo_prob * EXPECTED_BINGO_SCORE
-
-    return base
-
-
-def _formula_leave(leave_str, bag_empty=False):
-    """Simple leave formula when SuperLeaves lookup misses."""
-    if not leave_str:
-        return 0.0
-
-    value = 0.0
-    tiles = list(leave_str.upper())
-    n = len(tiles)
-
-    vowels = sum(1 for t in tiles if t in 'AEIOU')
-
-    if n >= 2:
-        ratio = vowels / n if n > 0 else 0.5
-        if ratio < 0.2 or ratio > 0.7:
-            value -= 5.0
-        elif ratio < 0.3 or ratio > 0.6:
-            value -= 2.0
-
-    counts = Counter(tiles)
-    for letter, cnt in counts.items():
-        if letter != '?' and cnt >= 2:
-            value -= (cnt - 1) * 3.0
-
-    blanks = counts.get('?', 0)
-    value += blanks * 15.0
-
-    s_count = counts.get('S', 0)
-    value += min(s_count, 2) * 8.0
-
-    for t in tiles:
-        if t in ('Q', 'Z', 'X', 'J'):
-            value -= 5.0
-        elif t in ('V', 'W', 'K'):
-            value -= 2.0
-
-    return value
+def _leave_value(leave_str, bag_empty=False, bag_tiles=100):
+    """Evaluate leave quality using bag-decay weighted tile values."""
+    return _mybot_leave_value(leave_str, bag_tiles)
 
 
 # ---------------------------------------------------------------------------
@@ -341,177 +265,10 @@ def _rank_by_equity(moves, bag_tiles):
     ranked = []
     for m in moves:
         leave = m.get('leave', '')
-        lv = _leave_value(leave, bag_empty=bag_empty) if bag_tiles > 0 else 0.0
+        lv = _leave_value(leave, bag_empty=bag_empty, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
         ranked.append((m, m['score'] + lv, lv))
     ranked.sort(key=lambda x: -x[1])
     return ranked
-
-
-# ===================================================================
-# POSITIONAL ADJUSTMENT FUNCTIONS (main process, <25ms total)
-# ===================================================================
-
-def _get_new_positions(grid, move):
-    """Get positions of newly placed tiles (1-indexed). Returns list of (r, c, letter)."""
-    word = move['word']
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-    positions = []
-    for i, letter in enumerate(word):
-        if horizontal:
-            r, c = row, col + i
-        else:
-            r, c = row + i, col
-        if 1 <= r <= 15 and 1 <= c <= 15 and grid[r - 1][c - 1] is None:
-            positions.append((r, c, letter))
-    return positions
-
-
-def _get_word_positions(move):
-    """Get all positions the word occupies (1-indexed). Returns set of (r, c)."""
-    word = move['word']
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-    positions = set()
-    for i in range(len(word)):
-        if horizontal:
-            positions.add((row, col + i))
-        else:
-            positions.add((row + i, col))
-    return positions
-
-
-def _was_already_reachable(grid, pr, pc, word_positions):
-    """Check if a square was already adjacent to an existing tile before our move."""
-    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        ar, ac = pr + dr, pc + dc
-        if 1 <= ar <= 15 and 1 <= ac <= 15:
-            if (ar, ac) not in word_positions and grid[ar - 1][ac - 1] is not None:
-                return True
-    return False
-
-
-def _direction_count(grid, br, bc, word_positions):
-    """Count how many axes (H, V) a bonus square can be exploited from.
-
-    A bonus square is exploitable on an axis if there's an adjacent tile
-    along that axis (provides a hook for word formation).
-    Returns 1 or 2.
-    """
-    def _has_adj(r, c):
-        if 1 <= r <= 15 and 1 <= c <= 15:
-            if (r, c) in word_positions or grid[r - 1][c - 1] is not None:
-                return True
-        return False
-
-    h_ok = _has_adj(br, bc - 1) or _has_adj(br, bc + 1)
-    v_ok = _has_adj(br - 1, bc) or _has_adj(br + 1, bc)
-    return (1 if h_ok else 0) + (1 if v_ok else 0) or 1
-
-
-def _compute_risk(grid, move):
-    """Compute risk penalty for newly opened bonus squares.
-
-    Scans perpendicular neighbors of each tile in the word for bonus squares
-    that become newly reachable. Returns risk_penalty (positive float).
-    """
-    word_positions = _get_word_positions(move)
-    word = move['word']
-    row, col = move['row'], move['col']
-    horizontal = move['direction'] == 'H'
-    word_len = len(word)
-
-    risk_penalty = 0.0
-    seen_opened = set()
-
-    # Perpendicular adjacency for each tile in word
-    for i in range(word_len):
-        if horizontal:
-            r, c = row, col + i
-            adj = [(r - 1, c), (r + 1, c)]
-        else:
-            r, c = row + i, col
-            adj = [(r, c - 1), (r, c + 1)]
-
-        for nr, nc in adj:
-            if not (1 <= nr <= 15 and 1 <= nc <= 15):
-                continue
-            if (nr, nc) in word_positions or (nr, nc) in seen_opened:
-                continue
-            if grid[nr - 1][nc - 1] is not None:
-                continue
-            bonus_type = BONUS_SQUARES.get((nr, nc))
-            if bonus_type and not _was_already_reachable(grid, nr, nc, word_positions):
-                seen_opened.add((nr, nc))
-                dirs = _direction_count(grid, nr, nc, word_positions)
-                mult = DUAL_DIRECTION_MULT if dirs >= 2 else 1.0
-                risk_penalty += RISK_PENALTIES.get(bonus_type, 0) * mult
-
-    return risk_penalty
-
-
-def _compute_dls_exposure(grid, move, unseen_pool=None):
-    """Penalty for tiles adjacent to open DLS when opponent might have HVTs."""
-    new_positions = _get_new_positions(grid, move)
-    horizontal = move['direction'] == 'H'
-
-    total_penalty = 0.0
-    unseen_counts = Counter(unseen_pool) if unseen_pool else None
-    total_unseen = len(unseen_pool) if unseen_pool else 0
-
-    for r, c, letter in new_positions:
-        adj_positions = []
-        if horizontal:
-            for dist in [1, 2]:
-                adj_positions.append((r - dist, c))
-                adj_positions.append((r + dist, c))
-            adj_positions.append((r, c - 1))
-            adj_positions.append((r, c + 1))
-        else:
-            for dist in [1, 2]:
-                adj_positions.append((r, c - dist))
-                adj_positions.append((r, c + dist))
-            adj_positions.append((r - 1, c))
-            adj_positions.append((r + 1, c))
-
-        for ar, ac in adj_positions:
-            if not (1 <= ar <= 15 and 1 <= ac <= 15):
-                continue
-            if (ar, ac) not in DLS_POSITIONS or grid[ar - 1][ac - 1] is not None:
-                continue
-
-            max_damage = 0
-            worst_tile = None
-            for hv_tile, hv_words in HIGH_VALUE_2LETTER.items():
-                tile_val = TILE_VALUES.get(hv_tile, 0)
-                for w in hv_words:
-                    if letter in w and len(w) == 2:
-                        damage = tile_val * 2 + TILE_VALUES.get(letter, 0)
-                        if damage > max_damage:
-                            max_damage = damage
-                            worst_tile = hv_tile
-
-            if max_damage > 0:
-                prob = 0.15
-                if unseen_counts and total_unseen > 0:
-                    tile_count = unseen_counts.get(worst_tile, 0)
-                    if tile_count > 0:
-                        prob = 1 - ((total_unseen - tile_count) / total_unseen) ** 7
-
-                dist = abs(ar - r) + abs(ac - c)
-                dist_factor = 1.0 if dist == 1 else 0.5
-                total_penalty += max_damage * prob * dist_factor
-            elif HOOKABILITY.get(letter, 0) > 10:
-                total_penalty += HOOKABILITY[letter] * 0.1
-
-    return -total_penalty
-
-
-def _compute_positional_adj(grid, move, unseen_pool, bag_size):
-    """Positional adjustment: risk penalty + DLS exposure."""
-    risk = _compute_risk(grid, move)
-    dls = _compute_dls_exposure(grid, move, unseen_pool)
-    return -risk + dls
 
 
 # ===================================================================
@@ -940,122 +697,6 @@ def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
 
 
 # ===================================================================
-# Blank correction factor (for MC opponent score adjustment)
-# ===================================================================
-
-def _blank_correction_factor(total_unseen, blanks_unseen):
-    """Correction multiplier for MC opponent scores when blanks are capped at 2.
-
-    Only needed when 3 blanks are unseen (Crossplay has 3 blanks).
-    Returns multiplier to apply to avg_opp (1.0 = no correction).
-    """
-    if blanks_unseen <= 2 or total_unseen < 7:
-        return 1.0
-
-    RATIO_0v2 = 0.470
-    RATIO_1v2 = 0.687
-    RATIO_3v2 = 1.036
-
-    draw = min(7, total_unseen)
-
-    def p_draw_k(k):
-        non = total_unseen - blanks_unseen
-        if k > blanks_unseen or k > draw or (draw - k) > non:
-            return 0.0
-        return comb(blanks_unseen, k) * comb(non, draw - k) / comb(total_unseen, draw)
-
-    p0 = p_draw_k(0)
-    p1 = p_draw_k(1)
-    p2 = p_draw_k(2)
-    p3 = p_draw_k(3) if blanks_unseen >= 3 else 0.0
-
-    e_true = p0 * RATIO_0v2 + p1 * RATIO_1v2 + p2 * 1.0 + p3 * RATIO_3v2
-
-    blanks_removed = blanks_unseen - 2
-    cap_total = total_unseen - blanks_removed
-    cap_blanks = 2
-    cap_draw = min(7, cap_total)
-
-    if cap_total < 1 or cap_draw < 1:
-        return 1.0
-
-    cap_non = cap_total - cap_blanks
-
-    def p_draw_k_capped(k):
-        if k > cap_blanks or k > cap_draw or (cap_draw - k) > cap_non:
-            return 0.0
-        return comb(cap_blanks, k) * comb(cap_non, cap_draw - k) / comb(cap_total, cap_draw)
-
-    cp0 = p_draw_k_capped(0)
-    cp1 = p_draw_k_capped(1)
-    cp2 = p_draw_k_capped(2)
-
-    e_capped = cp0 * RATIO_0v2 + cp1 * RATIO_1v2 + cp2 * 1.0
-
-    if e_capped <= 0:
-        return 1.0
-
-    return e_true / e_capped
-
-
-# ===================================================================
-# Exchange evaluation
-# ===================================================================
-
-def _generate_exchange_candidates(rack, unseen_pool):
-    """Generate top exchange options sorted by expected new rack leave."""
-    if len(unseen_pool) < RACK_SIZE:
-        return []
-
-    rack_list = list(rack.upper())
-    options = []
-
-    # Full exchange
-    total = 0.0
-    for _ in range(EXCHANGE_QUICK_MC):
-        drawn = random.sample(unseen_pool, min(RACK_SIZE, len(unseen_pool)))
-        total += _leave_value(''.join(drawn))
-    options.append({
-        'keep': '', 'dump': rack,
-        'expected_leave': total / EXCHANGE_QUICK_MC,
-    })
-
-    # Partial exchanges: keep 1-4 tiles
-    for keep_n in range(1, min(5, len(rack_list))):
-        seen_keeps = set()
-        for keep_combo in combinations(range(len(rack_list)), keep_n):
-            keep = tuple(sorted(rack_list[i] for i in keep_combo))
-            if keep in seen_keeps:
-                continue
-            seen_keeps.add(keep)
-
-            keep_str = ''.join(keep)
-            keep_lv = _leave_value(keep_str)
-            if keep_lv < -5 and keep_n >= 3:
-                continue
-
-            draw_n = RACK_SIZE - keep_n
-            total = 0.0
-            for _ in range(EXCHANGE_QUICK_MC):
-                drawn = random.sample(unseen_pool, min(draw_n, len(unseen_pool)))
-                new_rack = list(keep) + drawn
-                total += _leave_value(''.join(new_rack))
-            avg_leave = total / EXCHANGE_QUICK_MC
-
-            remaining = list(rack_list)
-            for t in keep:
-                remaining.remove(t)
-
-            options.append({
-                'keep': keep_str, 'dump': ''.join(remaining),
-                'expected_leave': avg_leave,
-            })
-
-    options.sort(key=lambda x: -x['expected_leave'])
-    return options[:EXCHANGE_TOP_CANDIDATES]
-
-
-# ===================================================================
 # DadBot class
 # ===================================================================
 
@@ -1119,7 +760,7 @@ class DadBot(BaseEngine):
                 time_budget=cfg.get('NEAR_ENDGAME_TIME', 15.0))
 
         # ---------------------------------------------------------------
-        # Mid-game: parallel MC 2-ply with SuperLeaves + positional adj
+        # Mid-game: parallel MC 2-ply with leave formula
         # ---------------------------------------------------------------
         t_move_start = time.perf_counter()
         unseen_pool = _compute_unseen(grid, rack, blanks_on_board)
@@ -1127,42 +768,21 @@ class DadBot(BaseEngine):
         # Rank candidates by 1-ply equity (score + leave)
         t0 = time.perf_counter()
         ranked = _rank_by_equity(moves, bag_tiles)
-        n_cands = cfg['N_CANDIDATES']
+        n_cands = int(_DADBOT_N) if _DADBOT_N else cfg['N_CANDIDATES']
         candidates = [(m, lv) for m, eq, lv in ranked[:n_cands]]
         t_rank = time.perf_counter() - t0
-
-        # Compute positional adjustment for each candidate (main process, <25ms)
-        t0 = time.perf_counter()
-        pos_adjs = []
-        for move, lv in candidates:
-            pos_adj = _compute_positional_adj(grid, move, unseen_pool, bag_tiles)
-            pos_adjs.append(pos_adj)
-        t_posadj = time.perf_counter() - t0
 
         # MC skip: if top 1-ply candidate leads by a wide margin, skip MC
         mc_skip_margin = cfg.get('MC_SKIP_MARGIN', 0)
         if mc_skip_margin > 0 and len(candidates) >= 2:
-            # Combine 1-ply equity + positional adj for skip comparison
-            top_eq = ranked[0][1] + pos_adjs[0] * MC_POSITIONAL_DAMPEN
-            second_eq = ranked[1][1] + pos_adjs[1] * MC_POSITIONAL_DAMPEN
+            top_eq = ranked[0][1]
+            second_eq = ranked[1][1]
             if top_eq - second_eq >= mc_skip_margin:
                 return candidates[0][0]
 
-        # Check if exchange should be considered
-        t0 = time.perf_counter()
-        best_1ply_equity = ranked[0][1] if ranked else 0
-        exch_opts = None
-        n_exch_combos = 0
-        if (cfg.get('EXCHANGE_EVAL', True)
-                and best_1ply_equity < EXCHANGE_EQUITY_THRESHOLD
-                and bag_tiles >= RACK_SIZE):
-            exch_opts = _generate_exchange_candidates(rack, unseen_pool)
-            n_exch_combos = len(exch_opts) if exch_opts else 0
-        t_exch = time.perf_counter() - t0
-
         # Build work items for MC (with tier-specific ES params)
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
-        k_sims = cfg['K_SIMS']
+        k_sims = int(_DADBOT_K) if _DADBOT_K else cfg['K_SIMS']
         es_se = cfg['ES_SE_THRESHOLD']
         es_min = cfg.get('ES_MIN_SIMS', 30)
 
@@ -1177,7 +797,7 @@ class DadBot(BaseEngine):
                 'blanks_used': move.get('blanks_used', []),
                 'tiles_used': move.get('tiles_used', list(move['word'])),
             }
-            seed = random.randint(0, 2**31)
+            seed = _rng.randint(0, 2**31)
             work.append((grid, bb_set_list, move_data, unseen_pool,
                          k_sims, seed, es_min, ES_CHECK_EVERY, es_se))
 
@@ -1186,11 +806,7 @@ class DadBot(BaseEngine):
         pool = _get_pool()
         futures = [pool.submit(_worker_eval_candidate, w) for w in work]
 
-        # Compute blank correction factor
-        blanks_in_unseen = sum(1 for t in unseen_pool if t == '?')
-        blank_corr = _blank_correction_factor(len(unseen_pool), blanks_in_unseen)
-
-        # Collect regular move results
+        # Collect results and pick best
         best_move = None
         best_total = float('-inf')
         bag_empty_flag = bag_tiles <= RACK_SIZE
@@ -1198,16 +814,16 @@ class DadBot(BaseEngine):
 
         for i, future in enumerate(futures):
             result = future.result(timeout=60)
-            avg_opp = result['avg_opp'] * blank_corr  # Apply blank correction
-            total_sims += result.get('n_sims', 0)
+            avg_opp = result['avg_opp']
+            n_sims = result.get('n_sims', 0)
+            total_sims += n_sims
             move, leave_val = candidates[i]
             mc_equity = move['score'] - avg_opp
 
             leave = move.get('leave', '')
-            lv = _leave_value(leave, bag_empty=bag_empty_flag) if bag_tiles > 0 else 0.0
+            lv = _leave_value(leave, bag_empty=bag_empty_flag, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
 
-            # Combine: MC equity + leave + damped positional adjustment
-            total = mc_equity + lv + pos_adjs[i] * MC_POSITIONAL_DAMPEN
+            total = mc_equity + lv
 
             if total > best_total:
                 best_total = total
@@ -1220,18 +836,10 @@ class DadBot(BaseEngine):
         if _DIAG:
             sims_per_sec = total_sims / t_mc if t_mc > 0 else 0
             print(f"  [TIMING] rank={t_rank*1000:.0f}ms "
-                  f"posadj={t_posadj*1000:.0f}ms "
-                  f"exch={t_exch*1000:.0f}ms({n_exch_combos}opts) "
                   f"MC={t_mc*1000:.0f}ms({total_sims}sims,{sims_per_sec:.0f}/s) "
                   f"total={t_total*1000:.0f}ms "
                   f"bag={bag_tiles} cands={len(candidates)} "
                   f"moves={len(moves)}")
-
-        # Simple exchange threshold check (non-MC path)
-        if exch_opts:
-            exch_leave = exch_opts[0]['expected_leave']
-            if exch_leave > best_1ply_equity and best_total < 0:
-                return None
 
         return best_move
 

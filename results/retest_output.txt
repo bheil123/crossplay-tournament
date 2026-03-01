@@ -1,0 +1,218 @@
+============================================================
+  BASELINE: N=30 K=400 formula + posadj + exchange (20 games)
+============================================================
+  [DadBot] Overrides: N=30, K=400
+
+DadBot vs MyBot (20 games)
+Master seed: 700847761
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 1-1 (0 ties) spread: +26 (0.0 games/s)
+  [4/20] 2-2 (0 ties) spread: +44 (0.0 games/s)
+  [6/20] 3-3 (0 ties) spread: +31 (0.0 games/s)
+  [8/20] 4-4 (0 ties) spread: +22 (0.0 games/s)
+  [10/20] 5-5 (0 ties) spread: +20 (0.0 games/s)
+  [12/20] 6-6 (0 ties) spread: +3 (0.0 games/s)
+  [14/20] 7-7 (0 ties) spread: +0 (0.0 games/s)
+  [16/20] 8-8 (0 ties) spread: +0 (0.0 games/s)
+  [18/20] 10-8 (0 ties) spread: +5 (0.0 games/s)
+  [20/20] 11-9 (0 ties) spread: +8 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:   11  |  MyBot wins:    9  |  Ties: 0
+  Avg spread:    +8.4
+  DadBot avg:  407.8  |  MyBot avg:  399.4
+  Time: 2132.7s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 4.90s, p95 14.52s, max 23.76s (241 moves) [OVER -- target ~3s]
+    MyBot: avg 3.92s, p95 8.88s, max 15.29s (241 moves) [OVER -- target ~3s]
+
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+  [DadBot] Overrides: N=30, K=400
+
+============================================================
+  NO POSADJ: N=30 K=400 (20 games)
+============================================================
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+
+DadBot vs MyBot (20 games)
+Master seed: 700847761
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 2-0 (0 ties) spread: +64 (0.0 games/s)
+  [4/20] 4-0 (0 ties) spread: +88 (0.0 games/s)
+  [6/20] 5-0 (1 ties) spread: +80 (0.0 games/s)
+  [8/20] 7-0 (1 ties) spread: +79 (0.0 games/s)
+  [10/20] 8-1 (1 ties) spread: +73 (0.0 games/s)
+  [12/20] 8-3 (1 ties) spread: +52 (0.0 games/s)
+  [14/20] 9-4 (1 ties) spread: +52 (0.0 games/s)
+  [16/20] 11-4 (1 ties) spread: +55 (0.0 games/s)
+  [18/20] 13-4 (1 ties) spread: +56 (0.0 games/s)
+  [20/20] 14-5 (1 ties) spread: +43 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:   14  |  MyBot wins:    5  |  Ties: 1
+  Avg spread:    +43.0
+  DadBot avg:  433.6  |  MyBot avg:  390.6
+  Time: 2080.6s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 4.81s, p95 14.73s, max 34.68s (241 moves) [OVER -- target ~3s]
+    MyBot: avg 3.80s, p95 8.66s, max 12.71s (241 moves) [OVER -- target ~3s]
+
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ
+
+============================================================
+  NO EXCHANGE: N=30 K=400 (20 games)
+============================================================
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+
+DadBot vs MyBot (20 games)
+Master seed: 700847761
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 2-0 (0 ties) spread: +78 (0.0 games/s)
+  [4/20] 3-1 (0 ties) spread: +57 (0.0 games/s)
+  [6/20] 3-3 (0 ties) spread: +25 (0.0 games/s)
+  [8/20] 4-4 (0 ties) spread: +33 (0.0 games/s)
+  [10/20] 5-5 (0 ties) spread: +27 (0.0 games/s)
+  [12/20] 6-6 (0 ties) spread: +24 (0.0 games/s)
+  [14/20] 7-7 (0 ties) spread: +19 (0.0 games/s)
+  [16/20] 7-9 (0 ties) spread: +8 (0.0 games/s)
+  [18/20] 8-10 (0 ties) spread: +15 (0.0 games/s)
+  [20/20] 10-10 (0 ties) spread: +26 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:   10  |  MyBot wins:   10  |  Ties: 0
+  Avg spread:    +26.1
+  DadBot avg:  413.5  |  MyBot avg:  387.4
+  Time: 2141.9s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 4.75s, p95 14.45s, max 54.56s (253 moves) [OVER -- target ~3s]
+    MyBot: avg 3.75s, p95 8.13s, max 12.58s (249 moves) [OVER -- target ~3s]
+
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_EXCHANGE
+
+============================================================
+  STRIPPED: N=30 K=400 pure MC + formula (20 games)
+============================================================
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+
+DadBot vs MyBot (20 games)
+Master seed: 700847761
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 2-0 (0 ties) spread: +64 (0.0 games/s)
+  [4/20] 4-0 (0 ties) spread: +128 (0.0 games/s)
+  [6/20] 5-1 (0 ties) spread: +104 (0.0 games/s)
+  [8/20] 7-1 (0 ties) spread: +90 (0.0 games/s)
+  [10/20] 8-2 (0 ties) spread: +79 (0.0 games/s)
+  [12/20] 9-3 (0 ties) spread: +63 (0.0 games/s)
+  [14/20] 10-4 (0 ties) spread: +66 (0.0 games/s)
+  [16/20] 11-5 (0 ties) spread: +60 (0.0 games/s)
+  [18/20] 12-6 (0 ties) spread: +60 (0.0 games/s)
+  [20/20] 14-6 (0 ties) spread: +70 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:   14  |  MyBot wins:    6  |  Ties: 0
+  Avg spread:    +70.8
+  DadBot avg:  448.6  |  MyBot avg:  377.9
+  Time: 2034.7s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 4.39s, p95 12.70s, max 27.35s (242 moves) [OVER -- target ~3s]
+    MyBot: avg 4.02s, p95 9.39s, max 14.51s (240 moves) [OVER -- target ~3s]
+
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+  [DadBot] Overrides: N=30, K=400, NO_POSADJ, NO_EXCHANGE
+
+============================================================
+  N=15 BASELINE: K=400 formula + posadj + exchange (20 games)
+============================================================
+  [DadBot] Overrides: N=15, K=400
+
+DadBot vs MyBot (20 games)
+Master seed: 700847761
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 1-1 (0 ties) spread: +4 (0.0 games/s)
+  [4/20] 3-1 (0 ties) spread: +56 (0.0 games/s)
+  [6/20] 3-3 (0 ties) spread: +23 (0.0 games/s)
+  [8/20] 5-3 (0 ties) spread: +48 (0.0 games/s)
+  [10/20] 7-3 (0 ties) spread: +48 (0.0 games/s)
+  [12/20] 8-4 (0 ties) spread: +30 (0.0 games/s)
+  [14/20] 8-6 (0 ties) spread: +14 (0.0 games/s)
+  [16/20] 8-8 (0 ties) spread: -1 (0.0 games/s)
+  [18/20] 10-8 (0 ties) spread: +0 (0.0 games/s)
+  [20/20] 12-8 (0 ties) spread: +7 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:   12  |  MyBot wins:    8  |  Ties: 0
+  Avg spread:    +7.2
+  DadBot avg:  405.0  |  MyBot avg:  397.8
+  Time: 1755.2s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 3.26s, p95 8.95s, max 21.78s (243 moves) [OK]
+    MyBot: avg 3.97s, p95 8.68s, max 12.62s (241 moves) [OVER -- target ~3s]
+
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+  [DadBot] Overrides: N=15, K=400
+
+============================================================
+  Heuristic retest complete!
+============================================================
