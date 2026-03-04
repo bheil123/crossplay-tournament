@@ -1,23 +1,15 @@
 """
-DadBot v6 -- Parallel MC 2-ply with A/B test flags for SuperLeaves and 3-ply.
+DadBot v6 -- Parallel MC 2-ply with A/B test flags for leave evaluation.
 
-Based on DadBot v5. Adds two independent A/B test feature flags:
+Based on DadBot v5. A/B test feature flag for leave evaluation:
 
-  DADBOT_LEAVES=formula|superleaves  (default: formula)
+  DADBOT_LEAVES=formula|superleaves|blend  (default: formula)
     formula:      Hand-tuned per-tile formula (V21 baseline, proven in v5 A/B)
     superleaves:  Trained leave table (gen4 TD-learning) + bingo bonus fallback
+    blend:        alpha * formula + (1-alpha) * superleaves
 
-  DADBOT_3PLY=off|on  (default: off)
-    off:  MC 2-ply only (your move -> opponent response)
-    on:   3-ply override for bag 9-21 (your move -> opp -> your counter-response)
-          Adds ~5-15s per move in late-mid game; skipped for bag>21 and bag<9
-
-Both flags are independent of the tier system (BOT_TIER). Any tier can use
-any combination. This enables testing 4 configurations:
-  - formula + no-3ply  (current V21 baseline)
-  - superleaves + no-3ply
-  - formula + 3ply
-  - superleaves + 3ply
+  DADBOT_BLEND_ALPHA=0.5  (default: 0.5, only used when DADBOT_LEAVES=blend)
+    1.0 = pure formula, 0.0 = pure superleaves
 
 Architecture (inherited from v5):
   - Persistent worker pool initialized on first pick_move()
@@ -27,7 +19,6 @@ Architecture (inherited from v5):
 
 Evaluation modes:
   - Mid-game (bag > 8): Parallel MC 2-ply + leave eval + positional adj
-    Optional: 3-ply override when DADBOT_3PLY=on and bag 9-21
   - Near-endgame (bag 1-8): Hybrid -- exhaustive 3-ply for bag-emptying
     moves, parity-adjusted 1-ply for non-emptying moves
   - Endgame (bag=0): Deterministic minimax (opponent rack known exactly)
@@ -96,42 +87,31 @@ TIERS = {
         'EXCHANGE_EVAL': True,
         'MC_SKIP_MARGIN': 8.0,
     },
-    # v5: standard and deep use fast params (higher N/K regresses -- see A/B results)
     'standard': {
-        'N_CANDIDATES': 15,
-        'K_SIMS': 400,
-        'ES_SE_THRESHOLD': 1.2,
-        'ES_MIN_SIMS': 50,
-        'NEAR_ENDGAME_TIME': 5.0,
+        'N_CANDIDATES': 25,
+        'K_SIMS': 800,
+        'ES_SE_THRESHOLD': 1.0,
+        'ES_MIN_SIMS': 80,
+        'NEAR_ENDGAME_TIME': 8.0,
         'EXCHANGE_EVAL': True,
-        'MC_SKIP_MARGIN': 8.0,
+        'MC_SKIP_MARGIN': 6.0,
     },
     'deep': {
-        'N_CANDIDATES': 15,
-        'K_SIMS': 400,
-        'ES_SE_THRESHOLD': 1.2,
-        'ES_MIN_SIMS': 50,
-        'NEAR_ENDGAME_TIME': 5.0,
+        'N_CANDIDATES': 40,
+        'K_SIMS': 1500,
+        'ES_SE_THRESHOLD': 0.8,
+        'ES_MIN_SIMS': 120,
+        'NEAR_ENDGAME_TIME': 12.0,
         'EXCHANGE_EVAL': True,
-        'MC_SKIP_MARGIN': 8.0,
+        'MC_SKIP_MARGIN': 5.0,
     },
 }
 
 # ---------------------------------------------------------------------------
 # A/B test feature flags (independent of tier)
 # ---------------------------------------------------------------------------
-_DADBOT_LEAVES = os.environ.get('DADBOT_LEAVES', 'formula')  # 'formula' or 'superleaves'
-_DADBOT_3PLY = os.environ.get('DADBOT_3PLY', 'off')          # 'off' or 'on'
-
-# 3-ply lookahead (imported from main engine when enabled)
-_3ply_available = False
-if _DADBOT_3PLY == 'on':
-    try:
-        sys.path.insert(0, _CROSSPLAY_DIR)
-        from crossplay.lookahead_3ply import evaluate_3ply
-        _3ply_available = True
-    except ImportError:
-        pass
+_DADBOT_LEAVES = os.environ.get('DADBOT_LEAVES', 'formula')  # 'formula', 'superleaves', or 'blend'
+_DADBOT_BLEND_ALPHA = float(os.environ.get('DADBOT_BLEND_ALPHA', '0.5'))  # blend weight: 0=pure SL, 1=pure formula
 
 # Fixed MC parameters
 ES_CHECK_EVERY = 10         # Check convergence every N sims
@@ -249,6 +229,7 @@ def _leave_value(leave_str, bag_empty=False):
 
     formula:      Hand-tuned per-tile formula only (V21 baseline)
     superleaves:  Trained table -> formula fallback -> bingo bonus
+    blend:        alpha * formula + (1-alpha) * superleaves (DADBOT_BLEND_ALPHA)
     """
     if not leave_str or leave_str == '-':
         return 0.0
@@ -259,24 +240,30 @@ def _leave_value(leave_str, bag_empty=False):
     if _DADBOT_LEAVES == 'formula':
         return _formula_leave(leave_str, bag_empty)
 
-    # SuperLeaves mode: trained table -> formula fallback -> bingo bonus
+    # Get superleaves value (table hit or formula+bingo fallback)
+    sl_val = None
     if not bag_empty:
         table = _load_leaves()
         key = tuple(sorted(leave_str))
-        val = table.get(key)
-        if val is not None:
-            return val
+        sl_val = table.get(key)
 
-    base = _formula_leave(leave_str, bag_empty)
+    if sl_val is None:
+        # Fallback: formula + bingo bonus
+        sl_val = _formula_leave(leave_str, bag_empty)
+        if not bag_empty and len(leave_str) < 7:
+            bingo_db = _load_bingo_db()
+            leave_key = tuple(sorted(leave_str))
+            bingo_prob = bingo_db.get(leave_key, 0.0)
+            sl_val += BINGO_WEIGHT * bingo_prob * EXPECTED_BINGO_SCORE
 
-    # Add bingo probability bonus (only when bag has tiles and leave < 7)
-    if not bag_empty and len(leave_str) < 7:
-        bingo_db = _load_bingo_db()
-        leave_key = tuple(sorted(leave_str))
-        bingo_prob = bingo_db.get(leave_key, 0.0)
-        base += BINGO_WEIGHT * bingo_prob * EXPECTED_BINGO_SCORE
+    # Pure superleaves mode
+    if _DADBOT_LEAVES == 'superleaves':
+        return sl_val
 
-    return base
+    # Blend mode: alpha * formula + (1-alpha) * superleaves
+    formula_val = _formula_leave(leave_str, bag_empty)
+    alpha = _DADBOT_BLEND_ALPHA
+    return alpha * formula_val + (1.0 - alpha) * sl_val
 
 
 def _formula_leave(leave_str, bag_empty=False):
@@ -1127,8 +1114,8 @@ class DadBot(BaseEngine):
         # Log A/B config once
         _diag = os.environ.get('DADBOT_TIMING', '')
         if _diag:
-            print(f"  [DadBot v6] tier={tier} leaves={_DADBOT_LEAVES} "
-                  f"3ply={_DADBOT_3PLY}(avail={_3ply_available})")
+            blend_str = f" alpha={_DADBOT_BLEND_ALPHA}" if _DADBOT_LEAVES == 'blend' else ""
+            print(f"  [DadBot v6] tier={tier} leaves={_DADBOT_LEAVES}{blend_str}")
 
     @property
     def name(self):
@@ -1262,56 +1249,15 @@ class DadBot(BaseEngine):
 
         t_mc = time.perf_counter() - t0
 
-        # ---------------------------------------------------------------
-        # 3-PLY OVERRIDE (bag 9-21, when DADBOT_3PLY=on)
-        # Replaces MC pick with 3-ply ranking when available.
-        # 3-ply evaluates: your move -> opp best -> your counter-response,
-        # capturing the value of your follow-up that MC 2-ply misses.
-        # ---------------------------------------------------------------
-        t_3ply = 0.0
-        _3ply_word = None
-        if (_DADBOT_3PLY == 'on' and _3ply_available
-                and 9 <= bag_tiles <= 21):
-            t0_3ply = time.perf_counter()
-            try:
-                from crossplay.board import Board as _3ply_Board
-                # Build Board object from grid for 3-ply
-                _3b = _3ply_Board()
-                for r in range(BOARD_SIZE):
-                    for c in range(BOARD_SIZE):
-                        _3b._grid[r][c] = grid[r][c]
-
-                results_3ply = evaluate_3ply(
-                    _3b,
-                    your_rack=rack,
-                    unseen_tiles=''.join(unseen_pool),
-                    gaddag=_gaddag_obj,
-                    board_blanks=blanks_on_board or [],
-                    time_budget=15.0,
-                )
-                if results_3ply:
-                    _3ply_word = results_3ply[0]['word']
-                    # Find matching candidate from MC pool
-                    for move, lv in candidates:
-                        if move['word'] == _3ply_word:
-                            best_move = move
-                            break
-            except Exception as e:
-                if _DIAG:
-                    print(f"  [3PLY] error: {e}")
-            t_3ply = time.perf_counter() - t0_3ply
-
         t_total = time.perf_counter() - t_move_start
 
         # Timing diagnostics
         if _DIAG:
             sims_per_sec = total_sims / t_mc if t_mc > 0 else 0
-            _3ply_str = f" 3ply={t_3ply*1000:.0f}ms({_3ply_word})" if t_3ply > 0 else ""
             print(f"  [TIMING] rank={t_rank*1000:.0f}ms "
                   f"posadj={t_posadj*1000:.0f}ms "
                   f"exch={t_exch*1000:.0f}ms({n_exch_combos}opts) "
-                  f"MC={t_mc*1000:.0f}ms({total_sims}sims,{sims_per_sec:.0f}/s)"
-                  f"{_3ply_str} "
+                  f"MC={t_mc*1000:.0f}ms({total_sims}sims,{sims_per_sec:.0f}/s) "
                   f"total={t_total*1000:.0f}ms "
                   f"bag={bag_tiles} cands={len(candidates)} "
                   f"moves={len(moves)}")

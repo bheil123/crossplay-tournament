@@ -1,0 +1,49 @@
+=== DADBOT v6 A/B TOURNAMENT ===
+Started: 2026-03-03 09:25:07.022496
+Master seed: 1985053093
+Tier: fast
+Opponent: my_bot
+Games per config: 20
+Total games: 20
+Configs: blend
+
+============================================================
+CONFIG: blend  (DADBOT_LEAVES=blend, DADBOT_BLEND_ALPHA=0.3)
+Tier: fast, Games: 20
+Started: 2026-03-03 09:25:07.022496
+============================================================
+
+DadBot vs MyBot (20 games)
+Building GADDAG (first run takes ~48s, then cached)...
+  [DadBot] MC pool: 9 workers (12 threads - 3 reserved)
+  [2/20] 2-0 (0 ties) spread: +68 (0.0 games/s)
+  [4/20] 3-1 (0 ties) spread: +56 (0.0 games/s)
+  [6/20] 4-2 (0 ties) spread: +23 (0.0 games/s)
+  [8/20] 5-3 (0 ties) spread: +25 (0.0 games/s)
+  [10/20] 7-3 (0 ties) spread: +31 (0.0 games/s)
+  [12/20] 7-5 (0 ties) spread: +12 (0.0 games/s)
+  [14/20] 7-7 (0 ties) spread: -12 (0.0 games/s)
+  [16/20] 8-8 (0 ties) spread: -9 (0.0 games/s)
+  [18/20] 8-10 (0 ties) spread: -17 (0.0 games/s)
+  [20/20] 9-11 (0 ties) spread: -14 (0.0 games/s)
+
+============================================================
+  Results: DadBot vs MyBot (20 games)
+============================================================
+  DadBot wins:    9  |  MyBot wins:   11  |  Ties: 0
+  Avg spread:    -13.2
+  DadBot avg:  398.3  |  MyBot avg:  411.4
+  Time: 1104.9s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: fast):
+    DadBot: avg 1.78s, p95 5.10s, max 8.56s (242 moves) [OK]
+    MyBot: avg 2.83s, p95 6.56s, max 12.00s (236 moves) [OK]
+
+
+Completed: 2026-03-03 09:43:32.463505
+Exit code: 0
+
+
+=== TOURNAMENT COMPLETE ===
+Finished: 2026-03-03 09:43:32.463505

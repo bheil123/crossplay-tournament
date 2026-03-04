@@ -1,16 +1,16 @@
-"""Run DadBot v6 A/B tournament testing SuperLeaves and 3-ply features.
+"""Run DadBot v6 A/B tournament testing leave evaluation strategies.
 
-A/B test matrix (4 configurations, each vs dadbot_v5 baseline):
-  1. formula + no-3ply  (V21 baseline -- should match v5)
-  2. superleaves + no-3ply  (gen4 trained leaves only)
-  3. formula + 3ply  (3-ply override only)
-  4. superleaves + 3ply  (both features)
+A/B test matrix (3 configurations, each vs my_bot baseline):
+  1. baseline     -- formula leaves (V21 baseline)
+  2. superleaves  -- gen4 TD-trained leaves only
+  3. blend        -- alpha * formula + (1-alpha) * superleaves
 
 Usage:
     python run_tourney.py                    # Full A/B matrix (20 games each)
     python run_tourney.py --games 5          # Quick smoke test (5 games each)
     python run_tourney.py --config baseline  # Run single config only
     python run_tourney.py --tier fast        # Override tier (default: fast)
+    python run_tourney.py --alpha 0.3        # Override blend alpha (default: 0.5)
 """
 import subprocess
 import sys
@@ -24,16 +24,15 @@ SCRIPT = "play_match.py"
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT = os.path.join(WORK_DIR, "tourney_results.txt")
 
-# A/B test configurations: (label, DADBOT_LEAVES, DADBOT_3PLY)
+# A/B test configurations: (label, DADBOT_LEAVES)
 AB_CONFIGS = {
-    'baseline':     ('formula',      'off'),
-    'superleaves':  ('superleaves',  'off'),
-    '3ply':         ('formula',      'on'),
-    'both':         ('superleaves',  'on'),
+    'baseline':     'formula',
+    'superleaves':  'superleaves',
+    'blend':        'blend',
 }
 
 # Default: all configs
-DEFAULT_CONFIGS = ['baseline', 'superleaves', '3ply', 'both']
+DEFAULT_CONFIGS = ['baseline', 'superleaves', 'blend']
 
 
 def main():
@@ -44,8 +43,12 @@ def main():
                         help="Run single config only (default: all)")
     parser.add_argument('--tier', default='fast',
                         help="BOT_TIER for all configs (default: fast)")
-    parser.add_argument('--opponent', default='dadbot_v5',
-                        help="Opponent bot module (default: dadbot_v5)")
+    parser.add_argument('--opponent', default='my_bot',
+                        help="Opponent bot module (default: my_bot)")
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help="Blend alpha (default: 0.5, 1=formula, 0=superleaves)")
+    parser.add_argument('--seed', type=int, default=None,
+                        help="Master seed for reproducibility (default: random)")
     parser.add_argument('--timing', action='store_true',
                         help="Enable DADBOT_TIMING diagnostics")
     args = parser.parse_args()
@@ -55,7 +58,7 @@ def main():
     tier = args.tier
 
     # Generate master seed for reproducibility
-    master_seed = random.randint(0, 2**31)
+    master_seed = args.seed if args.seed is not None else random.randint(0, 2**31)
     rng = random.Random(master_seed)
     total_games = len(configs) * games_per
     all_seeds = [rng.randint(0, 2**31) for _ in range(total_games)]
@@ -79,13 +82,14 @@ def main():
         f.flush()
 
         for cfg_name in configs:
-            leaves, three_ply = AB_CONFIGS[cfg_name]
+            leaves = AB_CONFIGS[cfg_name]
             seeds = config_seeds[cfg_name]
             seeds_csv = ','.join(str(s) for s in seeds)
 
+            alpha_str = f", DADBOT_BLEND_ALPHA={args.alpha}" if leaves == 'blend' else ""
             f.write(f"{'='*60}\n")
             f.write(f"CONFIG: {cfg_name}  "
-                    f"(DADBOT_LEAVES={leaves}, DADBOT_3PLY={three_ply})\n")
+                    f"(DADBOT_LEAVES={leaves}{alpha_str})\n")
             f.write(f"Tier: {tier}, Games: {games_per}\n")
             f.write(f"Started: {datetime.datetime.now()}\n")
             f.write(f"{'='*60}\n")
@@ -95,7 +99,8 @@ def main():
             env = os.environ.copy()
             env['BOT_TIER'] = tier
             env['DADBOT_LEAVES'] = leaves
-            env['DADBOT_3PLY'] = three_ply
+            if leaves == 'blend':
+                env['DADBOT_BLEND_ALPHA'] = str(args.alpha)
             if args.timing:
                 env['DADBOT_TIMING'] = '1'
 
