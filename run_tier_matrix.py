@@ -1,12 +1,11 @@
-"""Run 4-tier x 2-config matrix: formula vs blend(0.5) at blitz/fast/standard/deep.
+"""Run 3-tier x 2-config matrix: formula vs denoised_medium superleaves.
 
 Same seed across all runs for apple-to-apple comparison.
-Results saved to tourney_tier_matrix.txt with all 8 runs combined.
+Results saved to tourney_tier_matrix.txt with all runs combined.
 """
 import subprocess
 import sys
 import os
-import random
 import datetime
 
 PYTHON = sys.executable
@@ -17,10 +16,16 @@ MASTER_SEED = 777888999  # Fixed seed for reproducibility across all runs
 GAMES = 20
 OPPONENT = "my_bot"
 
-TIERS = ['blitz', 'fast', 'standard', 'deep']
+DENOISED_PATH = os.path.normpath(os.path.join(
+    WORK_DIR, 'engine', 'data', 'denoised_medium.pkl'))
+
+TIERS = ['blitz', 'fast', 'standard']
 CONFIGS = [
     ('formula', {'DADBOT_LEAVES': 'formula'}),
-    ('blend_05', {'DADBOT_LEAVES': 'blend', 'DADBOT_BLEND_ALPHA': '0.5'}),
+    ('denoised_medium', {
+        'DADBOT_LEAVES': 'superleaves',
+        'DADBOT_LEAVES_PATH': DENOISED_PATH,
+    }),
 ]
 
 def main():
@@ -55,8 +60,6 @@ def main():
                 for k, v in env_vars.items():
                     env[k] = v
 
-                # Generate same seeds for this tier+config
-                # Use master seed so all runs get same game positions
                 result = subprocess.run(
                     [PYTHON, "play_match.py", "dadbot_v6", OPPONENT,
                      "--games", str(GAMES), "--tier", tier,
@@ -70,7 +73,6 @@ def main():
                 f.write(f"Exit code: {result.returncode}\n\n")
                 f.flush()
 
-                # Print progress to console
                 elapsed = (datetime.datetime.now() - started).total_seconds()
                 print(f"[{run_num}/{total_runs}] {tier}+{cfg_name} done "
                       f"(exit={result.returncode}, {elapsed:.0f}s elapsed)")

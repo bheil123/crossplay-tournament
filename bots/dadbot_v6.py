@@ -110,8 +110,30 @@ TIERS = {
 # ---------------------------------------------------------------------------
 # A/B test feature flags (independent of tier)
 # ---------------------------------------------------------------------------
-_DADBOT_LEAVES = os.environ.get('DADBOT_LEAVES', 'formula')  # 'formula', 'superleaves', or 'blend'
+_DADBOT_LEAVES = os.environ.get('DADBOT_LEAVES', 'formula')  # 'formula', 'superleaves', 'blend', or 'quackle'
 _DADBOT_BLEND_ALPHA = float(os.environ.get('DADBOT_BLEND_ALPHA', '0.5'))  # blend weight: 0=pure SL, 1=pure formula
+
+# Quackle-derived per-tile leave values (Crossplay-calibrated)
+_QUACKLE_TILE_VALUES = {
+    '?': 20.0, 'S': 7.0, 'Z': 5.12, 'X': 3.31, 'R': 1.10,
+    'C': 0.85, 'H': 0.60, 'M': 0.58, 'D': 0.45, 'E': 0.35,
+    'N': 0.22, 'L': 0.20, 'T': -0.10, 'P': -0.46, 'K': -0.20,
+    'Y': -0.63, 'A': -0.63, 'J': -0.80, 'B': -1.50, 'I': -2.07,
+    'F': -2.21, 'O': -2.50, 'G': -1.80, 'W': -4.50, 'U': -4.00,
+    'V': -6.50, 'Q': -6.79,
+}
+
+
+def _leave_decay(bag_size):
+    """Scale leave value down as bag empties (no tile penalty in Crossplay)."""
+    if bag_size is None or bag_size >= 30:
+        return 1.0
+    elif bag_size >= 15:
+        return 0.70
+    elif bag_size >= 7:
+        return 0.40
+    else:
+        return 0.10
 
 # Fixed MC parameters
 ES_CHECK_EVERY = 10         # Check convergence every N sims
@@ -186,9 +208,9 @@ HIGH_VALUE_2LETTER = {
 # ---------------------------------------------------------------------------
 # SuperLeaves table (crossplay engine's trained leave values)
 # ---------------------------------------------------------------------------
-_LEAVES_PATH = os.path.normpath(os.path.join(
+_LEAVES_PATH = os.environ.get('DADBOT_LEAVES_PATH', os.path.normpath(os.path.join(
     _TOURNAMENT_DIR, 'engine', 'data', 'deployed_leaves.pkl',
-))
+)))
 _leaves_table = None
 
 # Bingo probability database (crossplay engine's precomputed data)
@@ -224,19 +246,38 @@ def _load_bingo_db():
     return _bingo_db
 
 
-def _leave_value(leave_str, bag_empty=False):
+def _leave_value(leave_str, bag_empty=False, bag_size=None):
     """Evaluate leave quality. Mode controlled by DADBOT_LEAVES env var.
 
     formula:      Hand-tuned per-tile formula only (V21 baseline)
     superleaves:  Trained table -> formula fallback -> bingo bonus
     blend:        alpha * formula + (1-alpha) * superleaves (DADBOT_BLEND_ALPHA)
+    quackle:      Quackle-derived per-tile values with bag decay
     """
     if not leave_str or leave_str == '-':
         return 0.0
 
     leave_str = leave_str.upper()
 
-    # A/B: formula mode skips SuperLeaves + bingo entirely
+    # Quackle mode: per-tile values with bag decay
+    if _DADBOT_LEAVES == 'quackle':
+        value = sum(_QUACKLE_TILE_VALUES.get(t, -1.0) for t in leave_str)
+        vowels = sum(1 for t in leave_str if t in 'AEIOU')
+        consonants = sum(1 for t in leave_str
+                         if t.isalpha() and t not in 'AEIOU' and t != '?')
+        if len(leave_str) >= 2:
+            if vowels == 1 and consonants >= 1:
+                value += 2.0
+            elif vowels >= 2 and consonants == 0:
+                value -= 5.0
+        if 'Q' in leave_str:
+            value -= 4.0
+        if bag_size is None and bag_empty:
+            bag_size = 0
+        value *= _leave_decay(bag_size)
+        return value
+
+    # Formula mode: hand-tuned per-tile formula (V21 baseline)
     if _DADBOT_LEAVES == 'formula':
         return _formula_leave(leave_str, bag_empty)
 
@@ -370,7 +411,7 @@ def _rank_by_equity(moves, bag_tiles):
     ranked = []
     for m in moves:
         leave = m.get('leave', '')
-        lv = _leave_value(leave, bag_empty=bag_empty) if bag_tiles > 0 else 0.0
+        lv = _leave_value(leave, bag_empty=bag_empty, bag_size=bag_tiles) if bag_tiles > 0 else 0.0
         ranked.append((m, m['score'] + lv, lv))
     ranked.sort(key=lambda x: -x[1])
     return ranked
@@ -1238,7 +1279,7 @@ class DadBot(BaseEngine):
             mc_equity = move['score'] - avg_opp
 
             leave = move.get('leave', '')
-            lv = _leave_value(leave, bag_empty=bag_empty_flag) if bag_tiles > 0 else 0.0
+            lv = _leave_value(leave, bag_empty=bag_empty_flag, bag_size=bag_tiles) if bag_tiles > 0 else 0.0
 
             # Combine: MC equity + leave + damped positional adjustment
             total = mc_equity + lv + pos_adjs[i] * MC_POSITIONAL_DAMPEN
