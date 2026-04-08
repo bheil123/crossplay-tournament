@@ -68,6 +68,22 @@ from engine.config import (
 # ---------------------------------------------------------------------------
 # Calibrated for real throughput ~1600 sims/sec (8 workers under tournament load)
 TIERS = {
+    '1ply': {
+        'N_CANDIDATES': 1,
+        'K_SIMS': 0,
+        'ES_SE_THRESHOLD': 99,
+        'ES_MIN_SIMS': 0,
+        'NEAR_ENDGAME_TIME': 1.0,
+        'MC_SKIP_MARGIN': 0,
+    },
+    'turbo': {
+        'N_CANDIDATES': 3,
+        'K_SIMS': 50,
+        'ES_SE_THRESHOLD': 2.0,
+        'ES_MIN_SIMS': 10,
+        'NEAR_ENDGAME_TIME': 2.0,
+        'MC_SKIP_MARGIN': 15.0,
+    },
     'blitz': {
         'N_CANDIDATES': 7,
         'K_SIMS': 150,
@@ -166,6 +182,66 @@ _PARITY_P_OPP_EMPTIES = {
     5: 0.62, 6: 0.40, 7: 0.18,
 }
 _PARITY_STRUCTURAL_ADV = 10.0
+_QUICK_MC_SAMPLES = 25  # samples for non-emptying moves at bag 4-8
+_quick_mc_rng = random.Random(99)  # separate RNG to avoid contaminating MC seeds
+
+
+def _quick_mc_opp_score(board, move, unseen_pool, blanks_on_board, n_samples=25):
+    """Quick 2-ply MC for a single move: sample opponent racks, return avg score.
+
+    Runs in main process using Cython -- no worker pool needed.
+    ~0.5ms per sample, so 25 samples = ~12ms per candidate.
+    """
+    _ensure_resources()
+    accel = _get_accel()
+    if accel is None or _gdata_bytes is None:
+        return None  # can't run without Cython
+
+    from engine.board import Board as EngBoard
+
+    # Place move on a copy
+    eval_board = board.copy() if hasattr(board, 'copy') else EngBoard()
+    if not hasattr(board, 'copy'):
+        for r in range(15):
+            for c in range(15):
+                if board._grid[r][c] is not None:
+                    eval_board._grid[r][c] = board._grid[r][c]
+
+    horizontal = move['direction'] == 'H'
+    placed = eval_board.place_move(move['word'], move['row'], move['col'], horizontal)
+
+    # Build blank set (0-indexed)
+    bb_set = set()
+    for entry in (blanks_on_board or []):
+        if len(entry) >= 2:
+            bb_set.add((entry[0] - 1, entry[1] - 1))
+    for bi in move.get('blanks_used', []):
+        if horizontal:
+            bb_set.add((move['row'] - 1, move['col'] - 1 + bi))
+        else:
+            bb_set.add((move['row'] - 1 + bi, move['col'] - 1))
+
+    # Prepare Cython context
+    ctx = accel.prepare_board_context(
+        eval_board._grid, _gdata_bytes, bb_set,
+        _word_set, VALID_TWO_LETTER,
+        _TV, _BONUS, BINGO_BONUS, RACK_SIZE,
+    )
+
+    pool_size = len(unseen_pool)
+    rack_draw = min(RACK_SIZE, pool_size)
+    total_opp = 0.0
+    n = 0
+
+    for _ in range(n_samples):
+        opp_rack = ''.join(_quick_mc_rng.sample(unseen_pool, rack_draw))
+        opp_score, _, _, _, _ = accel.find_best_score_c(ctx, opp_rack)
+        total_opp += opp_score
+        n += 1
+
+    eval_board.undo_move(placed)
+    return total_opp / n if n > 0 else 0.0
+
 
 # Pre-computed tables
 _TV = [0] * 26
@@ -259,13 +335,14 @@ def _compute_unseen(grid, my_rack, blanks_on_board):
 # ---------------------------------------------------------------------------
 # 1-ply equity ranking (score + leave value)
 # ---------------------------------------------------------------------------
-def _rank_by_equity(moves, bag_tiles):
+def _rank_by_equity(moves, bag_tiles, leave_fn=None):
     """Sort moves by 1-ply equity = score + leave_value. Returns sorted list."""
+    _lv_fn = leave_fn or _leave_value
     bag_empty = bag_tiles <= RACK_SIZE
     ranked = []
     for m in moves:
         leave = m.get('leave', '')
-        lv = _leave_value(leave, bag_empty=bag_empty, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
+        lv = _lv_fn(leave, bag_empty=bag_empty, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
         ranked.append((m, m['score'] + lv, lv))
     ranked.sort(key=lambda x: -x[1])
     return ranked
@@ -280,17 +357,33 @@ _w_word_set = None
 _w_accel = None
 _w_tv = None
 _w_bonus = None
+_w_magpie_lib = None
+_w_magpie_ctx = None
 
 
 def _worker_init(crossplay_dir, tournament_dir):
-    """Initialize worker: load GADDAG + dictionary + Cython extension."""
+    """Initialize worker: load MAGPIE C, Cython, or Python move finder."""
     global _w_gdata_bytes, _w_word_set, _w_accel, _w_tv, _w_bonus
+    global _w_magpie_lib, _w_magpie_ctx
 
     if tournament_dir not in sys.path:
         sys.path.insert(0, tournament_dir)
     if crossplay_dir not in sys.path:
         sys.path.insert(0, crossplay_dir)
 
+    # Try MAGPIE C movefinder first (6x faster)
+    _w_magpie_lib = None
+    _w_magpie_ctx = None
+    try:
+        from crossplay.magpie_movefinder import init as magpie_init
+        if magpie_init():
+            import crossplay.magpie_movefinder as mm
+            _w_magpie_lib = mm._lib
+            _w_magpie_ctx = mm._ctx
+    except Exception as e:
+        print(f"  [DadBot] Worker MAGPIE init failed: {e}")
+
+    # Always load GADDAG + dictionary (needed for Cython fallback)
     from engine.gaddag import get_gaddag
     _w_gdata_bytes = bytes(get_gaddag()._data)
 
@@ -360,12 +453,32 @@ def _worker_eval_candidate(args):
     pool_size = len(unseen_pool)
     rack_draw = min(RACK_SIZE, pool_size)
 
-    use_cython = (_w_accel is not None and
+    # Choose move finder: MAGPIE C (process) > Cython > Python
+    use_magpie = (_w_magpie_lib is not None and _w_magpie_ctx is not None)
+    use_cython = (not use_magpie and _w_accel is not None and
                   hasattr(_w_accel, 'prepare_board_context') and
                   _w_gdata_bytes is not None)
 
     ctx = None
-    if use_cython:
+    magpie_board = None
+    magpie_result = None
+
+    if use_magpie:
+        import ctypes
+        from crossplay.magpie_movefinder import MagpieMoveResult
+        magpie_board = (ctypes.c_uint8 * 225)()
+        for r in range(15):
+            for c in range(15):
+                cell = post_grid[r][c]
+                if cell is not None and isinstance(cell, str) and len(cell) == 1:
+                    ch = cell.upper()
+                    if 'A' <= ch <= 'Z':
+                        ml = ord(ch) - ord('A') + 1
+                        if (r, c) in bb_set:
+                            ml |= 0x80  # blank tile marker
+                        magpie_board[r * 15 + c] = ml
+        magpie_result = MagpieMoveResult()
+    elif use_cython:
         ctx = _w_accel.prepare_board_context(
             post_grid, _w_gdata_bytes, bb_set,
             _w_word_set, VALID_TWO_LETTER,
@@ -386,7 +499,16 @@ def _worker_eval_candidate(args):
 
         opp_rack = ''.join(random.sample(unseen_pool, rack_draw))
 
-        if use_cython:
+        if use_magpie:
+            import ctypes
+            found = _w_magpie_lib.magpie_find_best(
+                _w_magpie_ctx,
+                ctypes.cast(magpie_board, ctypes.POINTER(ctypes.c_uint8)),
+                opp_rack.encode('utf-8'),
+                ctypes.byref(magpie_result),
+            )
+            opp_score = magpie_result.score if found > 0 else 0
+        elif use_cython:
             opp_score, _, _, _, _ = _w_accel.find_best_score_c(ctx, opp_rack)
         else:
             blanks_1idx = [(r + 1, c + 1, '') for r, c in bb_set]
@@ -437,16 +559,20 @@ def _worker_eval_endgame(args):
             if grid[r][c] is not None:
                 board._grid[r][c] = grid[r][c]
 
-    horizontal = move['direction'] == 'H'
-    placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
-
-    # Update blank set with blanks from this move
+    is_pass = move.get('_is_pass', False)
+    placed = None
     move_bb = set(bb_set)
-    for bi in move.get('blanks_used', []):
-        if horizontal:
-            move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
-        else:
-            move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
+
+    if not is_pass:
+        horizontal = move['direction'] == 'H'
+        placed = board.place_move(move['word'], move['row'], move['col'], horizontal)
+
+        # Update blank set with blanks from this move
+        for bi in move.get('blanks_used', []):
+            if horizontal:
+                move_bb.add((move['row'] - 1, move['col'] - 1 + bi))
+            else:
+                move_bb.add((move['row'] - 1 + bi, move['col'] - 1))
 
     # Find opponent's best response
     use_cython = (_w_accel is not None and
@@ -465,7 +591,8 @@ def _worker_eval_endgame(args):
         opp_moves = get_legal_moves(board, opp_rack, blanks_1idx)
         opp_score = opp_moves[0]['score'] if opp_moves else 0
 
-    board.undo_move(placed)
+    if placed:
+        board.undo_move(placed)
     equity = move['score'] - opp_score
 
     return {
@@ -616,12 +743,48 @@ def _worker_eval_near_endgame(args):
 # Near-endgame hybrid evaluator (bag 1-8)
 # ===================================================================
 
+def _unseen_adjusted_leave(leave_str, unseen_pool, leave_fn):
+    """Adjust leave value based on what tiles remain in unseen pool.
+
+    At low bag counts, a tile's leave value should reflect what's actually
+    available to draw. If all S tiles are on the board, keeping S is less
+    valuable. Core leave value (playability) is kept at 50%; draw potential
+    (the other 50%) is scaled by unseen availability.
+    """
+    if not leave_str or leave_str == '-':
+        return 0.0
+
+    # Count unseen tile frequencies
+    unseen_counts = {}
+    for t in unseen_pool:
+        unseen_counts[t] = unseen_counts.get(t, 0) + 1
+
+    # Get base leave value
+    base = leave_fn(leave_str, bag_empty=False, bag_tiles=len(unseen_pool))
+
+    # Scale factor: what fraction of each leave tile exists in unseen?
+    # Tiles with 0 remaining get reduced; tiles abundant in unseen get full value.
+    total_tiles = len(leave_str)
+    if total_tiles == 0:
+        return base
+
+    pool_richness = 0.0
+    for t in leave_str.upper():
+        avail = unseen_counts.get(t, 0)
+        full = TILE_DISTRIBUTION.get(t, 1)
+        pool_richness += min(1.0, avail / max(1, full))
+    pool_richness /= total_tiles  # 0.0 = all depleted, 1.0 = fully available
+
+    # Blend: 50% base value (playability) + 50% scaled by pool richness
+    return base * (0.5 + 0.5 * pool_richness)
+
+
 def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
-                           time_budget=15.0):
+                           time_budget=15.0, leave_fn=None):
     """Hybrid evaluation for bag 1-8. Parallel.
 
     Bag-emptying moves: parallel exhaustive 3-ply via worker pool.
-    Non-emptying moves: parity-adjusted 1-ply equity (instant, main process).
+    Non-emptying moves: quick MC 2-ply (bag 4-8) or exhaustive (bag 1-3).
 
     Returns best move.
     """
@@ -630,29 +793,69 @@ def _evaluate_near_endgame(board, rack, moves, unseen_pool, blanks_on_board,
 
     results = []
 
-    ranked = _rank_by_equity(moves, bag_size)
-    candidates = ranked[:25]
+    # Use unseen-adjusted leave values for near-endgame ranking
+    _lv_fn = leave_fn or _leave_value
+    def _adjusted_leave_fn(leave_str, bag_empty=False, bag_tiles=100):
+        return _unseen_adjusted_leave(leave_str, unseen_pool, _lv_fn)
+
+    ranked = _rank_by_equity(moves, bag_size, leave_fn=_adjusted_leave_fn)
+
+    # Ensure bag-emptying moves make the candidate list even if they rank
+    # lower on 1-ply. A longer, lower-scoring word that empties the bag
+    # gains the structural advantage of knowing the opponent's rack.
+    top_25 = ranked[:25]
+    candidate_set = {id(m) for m, _, _ in top_25}
+
+    # Find top bag-emptying moves not already in the top 25
+    bag_emptying_extras = []
+    for move, eq, lv in ranked[25:]:
+        tiles_used = move.get('tiles_used', [])
+        if len(tiles_used) >= bag_size and id(move) not in candidate_set:
+            bag_emptying_extras.append((move, eq, lv))
+            if len(bag_emptying_extras) >= 5:
+                break
+
+    candidates = top_25 + bag_emptying_extras
 
     bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
     grid = [row[:] for row in board._grid]
 
-    # PASS 1: non-emptying moves (instant -- parity-adjusted 1-ply)
+    # PASS 1: classify moves into exhaustive vs parity-adjusted 1-ply.
+    # At bag 1-3, ALL moves get exhaustive evaluation (8-120 combos,
+    # computationally cheap). At bag 4-8, only bag-emptying moves get
+    # exhaustive; non-emptying get parity-adjusted 1-ply.
     exhaust_cands = []
     for move, equity_1ply, leave_val in candidates:
         tiles_used = move.get('tiles_used', [])
         n_used = len(tiles_used)
 
-        if n_used >= bag_size:
+        if n_used >= bag_size or bag_size <= 3:
+            # Bag-emptying OR bag 1-3: exhaustive 3-ply
             exhaust_cands.append((move, equity_1ply, leave_val))
         else:
-            n_draw = min(n_used, bag_size)
-            bag_after = bag_size - n_draw
-            parity_penalty = 0.0
-            if 1 <= bag_after <= 7:
-                p_opp = _PARITY_P_OPP_EMPTIES.get(bag_after, 0.0)
-                parity_penalty = -p_opp * _PARITY_STRUCTURAL_ADV
-
-            results.append((move, equity_1ply + parity_penalty))
+            # Bag 4-8 non-emptying: quick 2-ply MC (score - avg_opp + leave)
+            avg_opp = _quick_mc_opp_score(
+                board, move, unseen_pool, blanks_on_board,
+                n_samples=_QUICK_MC_SAMPLES)
+            if avg_opp is not None:
+                mc_eq = move['score'] - avg_opp + leave_val
+                # Apply parity penalty on top of MC estimate
+                n_draw = min(n_used, bag_size)
+                bag_after = bag_size - n_draw
+                parity_penalty = 0.0
+                if 1 <= bag_after <= 7:
+                    p_opp = _PARITY_P_OPP_EMPTIES.get(bag_after, 0.0)
+                    parity_penalty = -p_opp * _PARITY_STRUCTURAL_ADV * 0.5
+                results.append((move, mc_eq + parity_penalty))
+            else:
+                # Fallback: parity-adjusted 1-ply (Cython unavailable)
+                n_draw = min(n_used, bag_size)
+                bag_after = bag_size - n_draw
+                parity_penalty = 0.0
+                if 1 <= bag_after <= 7:
+                    p_opp = _PARITY_P_OPP_EMPTIES.get(bag_after, 0.0)
+                    parity_penalty = -p_opp * _PARITY_STRUCTURAL_ADV
+                results.append((move, equity_1ply + parity_penalty))
 
     # PASS 2: bag-emptying moves -- parallel exhaustive 3-ply via workers
     if exhaust_cands:
@@ -732,6 +935,10 @@ class DadBot(BaseEngine):
         """Called when game ends. Pool kept alive for multi-game matches."""
         pass  # Workers persist -- GADDAG loaded once per pool lifetime
 
+    def _get_leave_fn(self):
+        """Return the leave evaluation function. Override in subclasses."""
+        return _leave_value
+
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
@@ -743,6 +950,7 @@ class DadBot(BaseEngine):
         blanks_on_board = game_info.get('blanks_on_board', [])
         grid = [row[:] for row in board._grid]
         cfg = self.config
+        leave_fn = self._get_leave_fn()
 
         # ---------------------------------------------------------------
         # Endgame: bag=0, deterministic minimax
@@ -757,7 +965,8 @@ class DadBot(BaseEngine):
             unseen_pool = _compute_unseen(grid, rack, blanks_on_board)
             return _evaluate_near_endgame(
                 board, rack, moves, unseen_pool, blanks_on_board,
-                time_budget=cfg.get('NEAR_ENDGAME_TIME', 15.0))
+                time_budget=cfg.get('NEAR_ENDGAME_TIME', 15.0),
+                leave_fn=leave_fn)
 
         # ---------------------------------------------------------------
         # Mid-game: parallel MC 2-ply with leave formula
@@ -767,10 +976,15 @@ class DadBot(BaseEngine):
 
         # Rank candidates by 1-ply equity (score + leave)
         t0 = time.perf_counter()
-        ranked = _rank_by_equity(moves, bag_tiles)
+        ranked = _rank_by_equity(moves, bag_tiles, leave_fn=leave_fn)
         n_cands = int(_DADBOT_N) if _DADBOT_N else cfg['N_CANDIDATES']
         candidates = [(m, lv) for m, eq, lv in ranked[:n_cands]]
         t_rank = time.perf_counter() - t0
+
+        # 1-ply only: skip MC entirely if K_SIMS=0
+        k_sims = int(_DADBOT_K) if _DADBOT_K else cfg['K_SIMS']
+        if k_sims <= 0:
+            return candidates[0][0]
 
         # MC skip: if top 1-ply candidate leads by a wide margin, skip MC
         mc_skip_margin = cfg.get('MC_SKIP_MARGIN', 0)
@@ -782,7 +996,6 @@ class DadBot(BaseEngine):
 
         # Build work items for MC (with tier-specific ES params)
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
-        k_sims = int(_DADBOT_K) if _DADBOT_K else cfg['K_SIMS']
         es_se = cfg['ES_SE_THRESHOLD']
         es_min = cfg.get('ES_MIN_SIMS', 30)
 
@@ -821,7 +1034,7 @@ class DadBot(BaseEngine):
             mc_equity = move['score'] - avg_opp
 
             leave = move.get('leave', '')
-            lv = _leave_value(leave, bag_empty=bag_empty_flag, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
+            lv = leave_fn(leave, bag_empty=bag_empty_flag, bag_tiles=bag_tiles) if bag_tiles > 0 else 0.0
 
             total = mc_equity + lv
 
@@ -856,7 +1069,7 @@ class DadBot(BaseEngine):
 
         bb_set_list = [(r - 1, c - 1) for r, c, _ in (blanks_on_board or [])]
 
-        # Evaluate ALL legal moves (exhaustive minimax)
+        # Evaluate ALL legal moves + pass (exhaustive minimax)
         work = []
         for move in moves:
             move_data = {
@@ -868,6 +1081,13 @@ class DadBot(BaseEngine):
                 'blanks_used': move.get('blanks_used', []),
             }
             work.append((grid, bb_set_list, move_data, opp_rack))
+
+        # Also evaluate passing (score=0, opponent plays on current board)
+        pass_move_data = {
+            'word': '', 'row': 0, 'col': 0, 'direction': 'H',
+            'score': 0, 'blanks_used': [], '_is_pass': True,
+        }
+        work.append((grid, bb_set_list, pass_move_data, opp_rack))
 
         # Fan out to worker pool
         pool = _get_pool()
@@ -896,7 +1116,11 @@ class DadBot(BaseEngine):
                 continue
             if result['equity'] > best_equity:
                 best_equity = result['equity']
-                best_move = moves[i]
+                if i < len(moves):
+                    best_move = moves[i]
+                else:
+                    # Pass move was best -- return None to signal pass
+                    best_move = None
 
         if timed_out:
             print(f"  [DadBot] Endgame: {completed}/{len(futures)} evaluated, "

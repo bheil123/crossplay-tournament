@@ -528,7 +528,7 @@ def main():
     parser.add_argument('--games', type=int, default=10, help='Number of games (default: 10)')
     parser.add_argument('--watch', action='store_true', help='Watch a single game with board display')
     parser.add_argument('--tournament', action='store_true', help='Round-robin all bots in bots/')
-    parser.add_argument('--tier', choices=['blitz', 'fast', 'standard', 'deep'],
+    parser.add_argument('--tier', choices=['1ply', 'turbo', 'blitz', 'fast', 'standard', 'deep'],
                         default=None, help='Speed tier (sets BOT_TIER env var)')
     parser.add_argument('--seed', type=int, default=None,
                         help='Master seed for reproducible games (per-game seeds derived from this)')
