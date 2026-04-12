@@ -1,0 +1,162 @@
+DadBot v7 Ladder — 50 games each, seed 42
+Started: 2026-04-09 22:57:04
+======================================================================
+
+
+######################################################################
+  BLITZ TIER
+######################################################################
+
+--- bot_quackle_leave (460s) ---
+  Results: DadBot-v7 vs BotQuackleLeave (50 games)
+============================================================
+  DadBot-v7 wins:   31  |  BotQuackleLeave wins:   19  |  Ties: 0
+  Avg spread:    +26.3
+  DadBot-v7 avg:  436.7  |  BotQuackleLeave avg:  410.4
+  Time: 459.0s (0.1 games/s)
+============================================================
+
+  Speed Report (tier: blitz):
+    DadBot-v7: avg 0.77s, p95 2.05s, max 12.24s (575 moves) [OK]
+    BotQuackleLeave: avg 0.00s, p95 0.00s, max 0.00s (566 moves) [OK]
+
+
+--- magpie_leaves_bot (506s) ---
+  Results: DadBot-v7 vs MagpieLeavesBot (50 games)
+============================================================
+  DadBot-v7 wins:   30  |  MagpieLeavesBot wins:   20  |  Ties: 0
+  Avg spread:    +21.7
+  DadBot-v7 avg:  436.1  |  MagpieLeavesBot avg:  414.4
+  Time: 503.1s (0.1 games/s)
+============================================================
+
+  Speed Report (tier: blitz):
+    DadBot-v7: avg 0.89s, p95 3.02s, max 16.41s (550 moves) [OK]
+    MagpieLeavesBot: avg 0.00s, p95 0.00s, max 0.01s (542 moves) [OK]
+
+
+--- leave_bot (427s) ---
+  Results: DadBot-v7 vs LeaveBot (50 games)
+============================================================
+  DadBot-v7 wins:   31  |  LeaveBot wins:   19  |  Ties: 0
+  Avg spread:    +16.0
+  DadBot-v7 avg:  440.3  |  LeaveBot avg:  424.3
+  Time: 425.3s (0.1 games/s)
+============================================================
+
+  Speed Report (tier: blitz):
+    DadBot-v7: avg 0.72s, p95 1.93s, max 21.97s (564 moves) [OK]
+    LeaveBot: avg 0.00s, p95 0.01s, max 0.07s (555 moves) [OK]
+
+
+--- formula_bot (386s) ---
+  Results: DadBot-v7 vs FormulaBot (50 games)
+============================================================
+  DadBot-v7 wins:   26  |  FormulaBot wins:   22  |  Ties: 2
+  Avg spread:    +9.3
+  DadBot-v7 avg:  429.9  |  FormulaBot avg:  420.6
+  Time: 385.5s (0.1 games/s)
+============================================================
+
+  Speed Report (tier: blitz):
+    DadBot-v7: avg 0.68s, p95 1.44s, max 17.47s (546 moves) [OK]
+    FormulaBot: avg 0.00s, p95 0.02s, max 0.05s (548 moves) [OK]
+
+
+--- superleaves_bot (368s) ---
+  Results: DadBot-v7 vs SuperLeavesBot (50 games)
+============================================================
+  DadBot-v7 wins:   22  |  SuperLeavesBot wins:   28  |  Ties: 0
+  Avg spread:    +7.3
+  DadBot-v7 avg:  426.6  |  SuperLeavesBot avg:  419.3
+  Time: 367.8s (0.1 games/s)
+============================================================
+
+  Speed Report (tier: blitz):
+    DadBot-v7: avg 0.64s, p95 1.66s, max 16.04s (556 moves) [OK]
+    SuperLeavesBot: avg 0.00s, p95 0.00s, max 0.27s (554 moves) [OK]
+
+
+  BLITZ tier total: 36 min
+
+
+######################################################################
+  STANDARD TIER
+######################################################################
+
+--- bot_quackle_leave (10926s) ---
+  Results: DadBot-v7 vs BotQuackleLeave (50 games)
+============================================================
+  DadBot-v7 wins:   30  |  BotQuackleLeave wins:   18  |  Ties: 2
+  Avg spread:    +38.7
+  DadBot-v7 avg:  444.9  |  BotQuackleLeave avg:  406.2
+  Time: 10925.6s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: standard):
+    DadBot-v7: avg 18.98s, p95 40.34s, max 95.29s (575 moves) [OVER -- target ~10s]
+    BotQuackleLeave: avg 0.00s, p95 0.00s, max 0.00s (565 moves) [OK]
+
+
+--- magpie_leaves_bot (9908s) ---
+  Results: DadBot-v7 vs MagpieLeavesBot (50 games)
+============================================================
+  DadBot-v7 wins:   25  |  MagpieLeavesBot wins:   25  |  Ties: 0
+  Avg spread:    +5.7
+  DadBot-v7 avg:  425.1  |  MagpieLeavesBot avg:  419.5
+  Time: 9907.7s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: standard):
+    DadBot-v7: avg 18.12s, p95 38.90s, max 61.54s (546 moves) [OVER -- target ~10s]
+    MagpieLeavesBot: avg 0.00s, p95 0.00s, max 0.01s (545 moves) [OK]
+
+
+--- leave_bot (10866s) ---
+  Results: DadBot-v7 vs LeaveBot (50 games)
+============================================================
+  DadBot-v7 wins:   20  |  LeaveBot wins:   30  |  Ties: 0
+  Avg spread:    -0.4
+  DadBot-v7 avg:  429.7  |  LeaveBot avg:  430.2
+  Time: 10865.6s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: standard):
+    DadBot-v7: avg 19.20s, p95 41.35s, max 108.16s (565 moves) [OVER -- target ~10s]
+    LeaveBot: avg 0.00s, p95 0.01s, max 0.07s (560 moves) [OK]
+
+
+--- formula_bot (10338s) ---
+  Results: DadBot-v7 vs FormulaBot (50 games)
+============================================================
+  DadBot-v7 wins:   29  |  FormulaBot wins:   20  |  Ties: 1
+  Avg spread:    +20.9
+  DadBot-v7 avg:  434.7  |  FormulaBot avg:  413.8
+  Time: 10337.9s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: standard):
+    DadBot-v7: avg 18.98s, p95 39.78s, max 108.82s (544 moves) [OVER -- target ~10s]
+    FormulaBot: avg 0.00s, p95 0.02s, max 0.05s (544 moves) [OK]
+
+
+--- superleaves_bot (10776s) ---
+  Results: DadBot-v7 vs SuperLeavesBot (50 games)
+============================================================
+  DadBot-v7 wins:   30  |  SuperLeavesBot wins:   19  |  Ties: 1
+  Avg spread:    +19.6
+  DadBot-v7 avg:  440.9  |  SuperLeavesBot avg:  421.3
+  Time: 10775.8s (0.0 games/s)
+============================================================
+
+  Speed Report (tier: standard):
+    DadBot-v7: avg 19.32s, p95 42.13s, max 73.34s (557 moves) [OVER -- target ~10s]
+    SuperLeavesBot: avg 0.00s, p95 0.00s, max 0.25s (556 moves) [OK]
+
+
+  STANDARD tier total: 880 min
+
+
+======================================================================
+Total time: 15.3 hours
+Finished: 2026-04-10 14:13:04

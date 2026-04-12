@@ -25,6 +25,10 @@ Performance tiers (BOT_TIER env var):
   - standard: ~10s/move  (N=30, K=1500, SE=0.8, min_sims=80)
   - deep:     ~30s/move  (N=35, K=2000, SE=0.5, min_sims=100)
 
+Note: ES_SE_THRESHOLD, ES_MIN_SIMS, and NEAR_ENDGAME_TIME are V5-only
+(incremental MC with early stopping). V7 runs all K sims in one C call
+and only uses N_CANDIDATES and K_SIMS from the tier config.
+
 Falls back to sequential Python if Cython extension is unavailable.
 """
 
