@@ -1,15 +1,34 @@
 """
-DadBot V7 -- C-level MC eval + MAGPIE gen_6 leaves + opening book.
+DadBot V7 -- C-level MC eval + MAGPIE leaves + opening book + feature toggles.
 
 Architecture: V7 does MC evaluation in the MAIN PROCESS using
-magpie_mc_eval() (single C call per candidate, 75K sims/s).
-No worker pool needed for mid-game MC. Endgame/near-endgame
-delegated to V5 via super().pick_move() (uses _get_leave_fn hook).
+magpie_mc_eval() (single C call per candidate, ~1K sims/s on ARM64,
+~2K sims/s on i7-8700). All features are independently toggleable
+via environment variables for A/B testing.
 
-Differences from V5:
-- MAGPIE gen_6 leave values (C KLV, 0.7us/call)
-- Opening book (2.9M entries, move 1)
-- C-level MC eval (162x faster than Python per-sim)
+Feature Toggles (env vars):
+  V7_OPENING_BOOK=0|1     Opening book on/off (default: 1=on)
+  V7_LEAVES=magpie|formula|superleaves  Leave source (default: magpie)
+  V7_MC=c|python           MC engine: C bridge or v5 Python workers (default: c)
+  V7_BOGOWIN=0|1           Bogowin win% metric (default: 0=off)
+  V7_BOGOWIN_BLEND=0.0-1.0 Blend: 0=pure win%, 1=pure equity (default: 1.0)
+  V7_PTC=0|1               Play-to-completion mode (default: 0=off)
+  V7_NEAR_ENDGAME=0|1      V7 near-endgame evaluator (default: 0=delegate to v5)
+  V7_TILE_TRACKER=0|1      Precise unseen tile tracking (default: 0=off)
+  V7_NE_BAG=1-8            Bag threshold for near-endgame (default: 8)
+
+Inherited from V5:
+  BOT_TIER=blitz|fast|standard|deep  (default: fast)
+  MC_WORKERS=N             Worker count override
+  DADBOT_N=N               Override N_CANDIDATES
+  DADBOT_K=N               Override K_SIMS
+  DADBOT_TIMING=1          Timing diagnostics
+
+Tier config (only N_CANDIDATES and K_SIMS used by V7):
+  blitz:    ~1s/move   (N=7,  K=150)
+  fast:     ~3s/move   (N=15, K=400)   [default]
+  standard: ~10s/move  (N=30, K=1500)
+  deep:     ~30s/move  (N=35, K=2000)
 """
 
 import os
@@ -28,12 +47,42 @@ if os.path.isdir(_crossplay_root) and _crossplay_root not in sys.path:
 
 
 # ---------------------------------------------------------------------------
-# MAGPIE C leave evaluation
+# Feature flag helpers
+# ---------------------------------------------------------------------------
+
+def _flag(name, default=''):
+    """Get env var, strip whitespace."""
+    return os.environ.get(name, default).strip()
+
+
+def _flag_bool(name, default=False):
+    """Get boolean env var. '0'/'false'/''=False, anything else=True."""
+    val = _flag(name)
+    if not val:
+        return default
+    return val not in ('0', 'false', 'no', 'off')
+
+
+def _flag_float(name, default=1.0):
+    """Get float env var."""
+    val = _flag(name)
+    if not val:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Leave evaluation — toggleable source
 # ---------------------------------------------------------------------------
 
 _MAGPIE_LEAVE = None
 _MAGPIE_LEAVE_LOADED = False
 _MAGPIE_LEAVE_WARNED = False
+_SUPERLEAVES_TABLE = None
+_SUPERLEAVES_LOADED = False
 
 
 def _load_magpie_leave():
@@ -52,8 +101,41 @@ def _load_magpie_leave():
         print(f"  [v7] MAGPIE leave unavailable: {e}")
 
 
-def _v7_leave_value(leave_str, bag_empty=False, bag_tiles=100):
-    """Leave evaluation using MAGPIE C KLV (0.7us/call)."""
+def _load_superleaves():
+    global _SUPERLEAVES_TABLE, _SUPERLEAVES_LOADED
+    if _SUPERLEAVES_LOADED:
+        return
+    _SUPERLEAVES_LOADED = True
+    try:
+        import pickle
+        sl_path = os.path.join(_tourney_root, 'engine', 'data', 'deployed_leaves.pkl')
+        with open(sl_path, 'rb') as f:
+            data = pickle.load(f)
+        if isinstance(data, dict) and 'table' in data:
+            _SUPERLEAVES_TABLE = data['table']
+        else:
+            _SUPERLEAVES_TABLE = data
+        print(f"  [v7] SuperLeaves table loaded ({len(_SUPERLEAVES_TABLE):,} entries)")
+    except Exception as e:
+        print(f"  [v7] SuperLeaves unavailable: {e}")
+
+
+def _formula_leave_value(leave_str, bag_empty=False, bag_tiles=100):
+    """V5's hand-tuned per-tile formula."""
+    return _v5_leave_value(leave_str, bag_empty, bag_tiles)
+
+
+def _superleaves_leave_value(leave_str, bag_empty=False, bag_tiles=100):
+    """Trained SuperLeaves table lookup."""
+    _load_superleaves()
+    if _SUPERLEAVES_TABLE is not None:
+        key = tuple(sorted(leave_str.upper()))
+        return _SUPERLEAVES_TABLE.get(key, 0.0)
+    return _formula_leave_value(leave_str, bag_empty, bag_tiles)
+
+
+def _magpie_leave_value(leave_str, bag_empty=False, bag_tiles=100):
+    """MAGPIE C KLV leave lookup (0.7us/call)."""
     global _MAGPIE_LEAVE_WARNED
     _load_magpie_leave()
     if _MAGPIE_LEAVE is not None:
@@ -63,7 +145,17 @@ def _v7_leave_value(leave_str, bag_empty=False, bag_tiles=100):
             if not _MAGPIE_LEAVE_WARNED:
                 _MAGPIE_LEAVE_WARNED = True
                 print(f"  [v7] MAGPIE leave call failed (once): {e}")
-    return _v5_leave_value(leave_str, bag_empty, bag_tiles)
+    return _formula_leave_value(leave_str, bag_empty, bag_tiles)
+
+
+def _get_leave_fn_by_mode(mode):
+    """Return leave function based on V7_LEAVES mode."""
+    if mode == 'formula':
+        return _formula_leave_value
+    elif mode == 'superleaves':
+        return _superleaves_leave_value
+    else:  # 'magpie' (default)
+        return _magpie_leave_value
 
 
 # ---------------------------------------------------------------------------
@@ -118,21 +210,12 @@ def _get_mc_eval():
 
 
 # ---------------------------------------------------------------------------
-# Play-to-completion MC
+# Play-to-completion MC (unchanged from original)
 # ---------------------------------------------------------------------------
 
 def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
                         blanks_on_board, rng, leave_fn=None):
-    """Simulate game to completion with greedy play, return final spread.
-
-    After your candidate move (already scored as your_move_score):
-    1. Shuffle unseen, deal opponent rack (7 tiles)
-    2. Alternate: opponent plays best, you play best
-    3. Crossplay endgame: both get final turn after bag empties
-    4. Return your_total - opp_total (including your_move_score)
-
-    Uses Cython find_best_score_c for speed (~0.5ms per move generation).
-    """
+    """Simulate game to completion with greedy play, return final spread."""
     from engine.board import Board as EngBoard
     from engine.config import VALID_TWO_LETTER, BINGO_BONUS, RACK_SIZE
 
@@ -142,7 +225,6 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
     if accel is None or _w_gdata_bytes is None:
         return None
 
-    # Copy board state
     sim_board = board.copy() if hasattr(board, 'copy') else EngBoard()
     if not hasattr(board, 'copy'):
         for r in range(15):
@@ -150,13 +232,11 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
                 if board._grid[r][c] is not None:
                     sim_board._grid[r][c] = board._grid[r][c]
 
-    # Build blank set (0-indexed)
     bb_set = set()
     for entry in (blanks_on_board or []):
         if len(entry) >= 2:
             bb_set.add((entry[0] - 1, entry[1] - 1))
 
-    # Shuffle unseen and deal
     pool = list(unseen_pool)
     rng.shuffle(pool)
 
@@ -166,25 +246,19 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
     your_total = your_move_score
     opp_total = 0
     bag = list(remaining_pool)
-    final_turns = None  # None = mid-game, 2/1/0 = final turns
+    final_turns = None
 
-    # Racks as strings
     opp_rack = ''.join(opp_rack_list)
-    # Your rack is whatever leave you have (tiles_used already removed by caller)
-    # We need your leave -- the caller should pass it
-    # For now, draw from bag to fill your rack
     your_rack_list = list(your_rack)
     while len(your_rack_list) < RACK_SIZE and bag:
         your_rack_list.append(bag.pop())
     your_rack_str = ''.join(your_rack_list)
 
-    # Simulate alternating turns (opponent first after your move)
-    for turn in range(30):  # safety cap
+    for turn in range(30):
         if final_turns is not None and final_turns <= 0:
             break
 
-        # Whose turn?
-        is_opp_turn = (turn % 2 == 0)  # opponent goes first after your move
+        is_opp_turn = (turn % 2 == 0)
         rack_str = opp_rack if is_opp_turn else your_rack_str
 
         if not rack_str:
@@ -192,7 +266,6 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
                 final_turns -= 1
             continue
 
-        # Build context and find best move
         ctx = _w_accel.prepare_board_context(
             sim_board._grid, _w_gdata_bytes, bb_set,
             _w_word_set, VALID_TWO_LETTER,
@@ -205,7 +278,6 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
         score, word, row, col, dir_str = _w_accel.find_best_score_c(ctx, rack_str)
 
         if score <= 0 or word is None:
-            # Pass
             if final_turns is not None:
                 final_turns -= 1
             continue
@@ -213,33 +285,27 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
         if final_turns is not None:
             final_turns -= 1
 
-        # Place move
         horiz = dir_str == 'H'
         placed = sim_board.place_move(word, row, col, horiz)
 
-        # Update score
         if is_opp_turn:
             opp_total += score
         else:
             your_total += score
 
-        # Update rack: remove used tiles, draw new
         rack_list = list(rack_str)
         for i, letter in enumerate(word):
             r = row if horiz else row + i
             c = col + i if horiz else col
             if (r, c) in {pos for pos in placed}:
-                # This position was newly placed -- consumed from rack
                 if letter in rack_list:
                     rack_list.remove(letter)
                 elif '?' in rack_list:
                     rack_list.remove('?')
 
-        # Draw from bag
         while len(rack_list) < RACK_SIZE and bag:
             rack_list.append(bag.pop())
 
-        # Check if bag just emptied
         if len(bag) == 0 and final_turns is None:
             final_turns = 2
 
@@ -254,13 +320,9 @@ def _play_to_completion(board, your_rack, unseen_pool, your_move_score,
 
 def _ptc_eval_candidate(board, move, unseen_pool, blanks_on_board,
                         leave_str, rng, k_sims=20, leave_fn=None):
-    """Evaluate one candidate via play-to-completion MC.
-
-    Returns average final spread across k_sims simulations.
-    """
+    """Evaluate one candidate via play-to-completion MC."""
     from engine.board import Board as EngBoard
 
-    # Place candidate move on a copy
     eval_board = board.copy() if hasattr(board, 'copy') else EngBoard()
     if not hasattr(board, 'copy'):
         for r in range(15):
@@ -271,7 +333,6 @@ def _ptc_eval_candidate(board, move, unseen_pool, blanks_on_board,
     horizontal = move['direction'] == 'H'
     placed = eval_board.place_move(move['word'], move['row'], move['col'], horizontal)
 
-    # Build post-move blanks
     move_blanks = list(blanks_on_board)
     for bi in move.get('blanks_used', []):
         if horizontal:
@@ -296,7 +357,7 @@ def _ptc_eval_candidate(board, move, unseen_pool, blanks_on_board,
 
 
 # ---------------------------------------------------------------------------
-# Accel helpers for play-to-completion (worker-level access in main process)
+# Accel helpers (shared by PTC, near-endgame, and main process Cython)
 # ---------------------------------------------------------------------------
 _w_accel = None
 _w_gdata_bytes = None
@@ -350,38 +411,66 @@ def _get_accel():
     return _w_accel
 
 
+# Near-endgame time budgets per tier
+_V7_NE_TIMES = {'blitz': 2.0, 'fast': 5.0, 'standard': 15.0, 'deep': 30.0}
+
+
 # ---------------------------------------------------------------------------
 # DadBot V7
 # ---------------------------------------------------------------------------
 
 class DadBot(DadBotV5):
-    """DadBot V7: C MC eval + MAGPIE leaves + opening book + Bogowin."""
+    """DadBot V7: C MC eval + toggleable features for A/B testing."""
 
     def __init__(self):
         super().__init__()
-        _load_magpie_leave()
         self._move_times = []
         self._rng = random.Random(42)
         self._bogowin = None
         self._bogowin_loaded = False
+        self._flags_printed = False
 
     @property
     def name(self):
         return "DadBot-v7"
 
+    def _print_flags(self):
+        """Print active feature flags once."""
+        if self._flags_printed:
+            return
+        self._flags_printed = True
+        flags = []
+        if _flag('V7_LEAVES', 'magpie') != 'magpie':
+            flags.append(f"leaves={_flag('V7_LEAVES')}")
+        if not _flag_bool('V7_OPENING_BOOK', True):
+            flags.append("ob=off")
+        if _flag('V7_MC', 'c') != 'c':
+            flags.append(f"mc={_flag('V7_MC')}")
+        if _flag_bool('V7_BOGOWIN'):
+            blend = _flag_float('V7_BOGOWIN_BLEND', 1.0)
+            flags.append(f"bogowin(blend={blend})")
+        if _flag_bool('V7_PTC'):
+            flags.append("ptc")
+        if _flag_bool('V7_NEAR_ENDGAME'):
+            flags.append(f"ne(bag<={_flag('V7_NE_BAG', '8')})")
+        if _flag_bool('V7_TILE_TRACKER'):
+            flags.append("tt")
+        if flags:
+            print(f"  [v7] Flags: {', '.join(flags)}", flush=True)
+
     def _get_leave_fn(self):
-        """Override: use MAGPIE gen_6 C KLV leaves."""
-        return _v7_leave_value
+        """Override: use configured leave source."""
+        mode = _flag('V7_LEAVES', 'magpie')
+        return _get_leave_fn_by_mode(mode)
 
     def _get_bogowin(self):
         """Lazy-load Bogowin win% lookup."""
         if not self._bogowin_loaded:
             self._bogowin_loaded = True
-            if not os.environ.get('V7_BOGOWIN'):
-                return self._bogowin  # disabled by default; enable with V7_BOGOWIN=1
+            if not _flag_bool('V7_BOGOWIN'):
+                return self._bogowin
             try:
                 from crossplay.bogowin import get_win_probability
-                # Verify it works
                 test = get_win_probability(0, 50)
                 if isinstance(test, (int, float)):
                     self._bogowin = get_win_probability
@@ -390,12 +479,32 @@ class DadBot(DadBotV5):
                 print(f"  [v7] Bogowin unavailable: {e}")
         return self._bogowin
 
+    def _bogowin_metric(self, equity, current_spread, bag_after):
+        """Compute blended equity/win% metric."""
+        alpha = _flag_float('V7_BOGOWIN_BLEND', 1.0)
+        if alpha >= 1.0:
+            return equity  # pure equity (default)
+
+        bogowin_fn = self._get_bogowin()
+        if bogowin_fn is None:
+            return equity
+
+        projected_spread = current_spread + equity
+        win_pct = bogowin_fn(int(projected_spread), bag_after)
+        scale = 400.0  # map win% [0-1] to equity-comparable range
+
+        if alpha <= 0.0:
+            return win_pct * scale  # pure win%
+
+        return alpha * equity + (1 - alpha) * win_pct * scale
+
     def pick_move(self, board, rack, moves, game_info):
         if not moves:
             return None
 
         t_start = time.perf_counter()
         _ensure_resources()
+        self._print_flags()
 
         bag_tiles = game_info.get('tiles_in_bag', 1)
         blanks_on_board = game_info.get('blanks_on_board', [])
@@ -403,40 +512,60 @@ class DadBot(DadBotV5):
         cfg = self.config
 
         # -----------------------------------------------------------
-        # Opening book: first move on empty board
+        # Opening book (V7_OPENING_BOOK, default: on)
         # -----------------------------------------------------------
-        is_empty = all(grid[r][c] is None for r in range(15) for c in range(15))
-        if is_empty:
-            ob = _get_opening_move(list(rack))
-            if ob:
-                for m in moves:
-                    if m['word'] == ob['word'] and m['row'] == ob['row'] and m['col'] == ob['col']:
-                        self._record_time(t_start)
-                        return m
+        if _flag_bool('V7_OPENING_BOOK', True):
+            is_empty = all(grid[r][c] is None for r in range(15) for c in range(15))
+            if is_empty:
+                ob = _get_opening_move(list(rack))
+                if ob:
+                    for m in moves:
+                        if m['word'] == ob['word'] and m['row'] == ob['row'] and m['col'] == ob['col']:
+                            self._record_time(t_start)
+                            return m
 
         # -----------------------------------------------------------
-        # Endgame / near-endgame / no C MC: delegate to v5
-        # (v5 calls self._get_leave_fn() which returns MAGPIE leaves)
+        # Near-endgame / endgame routing
         # -----------------------------------------------------------
-        mc_eval_fn = _get_mc_eval()
-        if bag_tiles <= 8 or mc_eval_fn is None or cfg['K_SIMS'] <= 0:
+        ne_bag_threshold = int(_flag('V7_NE_BAG', '8'))
+        use_c_mc = _flag('V7_MC', 'c') == 'c'
+
+        if bag_tiles <= ne_bag_threshold:
+            if _flag_bool('V7_NEAR_ENDGAME'):
+                # V7's own near-endgame: uses v5's multiprocessing with
+                # ARM64 Cython workers (no timeout issues)
+                result = self._near_endgame_pick(board, rack, moves, game_info)
+                self._record_time(t_start)
+                return result
+            else:
+                # Delegate to V5 (original behavior)
+                result = super().pick_move(board, rack, moves, game_info)
+                self._record_time(t_start)
+                return result
+
+        # -----------------------------------------------------------
+        # MC engine selection (V7_MC, default: c)
+        # -----------------------------------------------------------
+        if use_c_mc:
+            mc_eval_fn = _get_mc_eval()
+        else:
+            mc_eval_fn = None  # forces v5 Python MC path
+
+        if mc_eval_fn is None or cfg['K_SIMS'] <= 0:
+            # No C MC available or disabled — delegate to v5
             result = super().pick_move(board, rack, moves, game_info)
             self._record_time(t_start)
             return result
 
         # -----------------------------------------------------------
-        # Mid-game: C MC eval or play-to-completion
+        # Mid-game: C MC eval (or PTC)
         # -----------------------------------------------------------
-
-        # 1-ply ranking with MAGPIE leaves
         leave_fn = self._get_leave_fn()
-        bag_empty = bag_tiles <= RACK_SIZE
         ranked = _rank_by_equity(moves, bag_tiles, leave_fn=leave_fn)
 
         n_cands = cfg['N_CANDIDATES']
         candidates = ranked[:n_cands]
 
-        # Build unseen pool
         unseen_pool = _compute_unseen(grid, rack, blanks_on_board)
         unseen_str = ''.join(unseen_pool)
 
@@ -446,12 +575,10 @@ class DadBot(DadBotV5):
 
         k_sims = cfg['K_SIMS']
         current_spread = game_info.get('your_score', 0) - game_info.get('opp_score', 0)
-
-        # Load Bogowin for win% selection
         bogowin_fn = self._get_bogowin()
 
-        # Play-to-completion mode (V7_PTC env var) -- uses C bridge
-        use_ptc = bool(os.environ.get('V7_PTC'))
+        # PTC mode
+        use_ptc = _flag_bool('V7_PTC')
         ptc_fn = None
         if use_ptc:
             try:
@@ -465,8 +592,7 @@ class DadBot(DadBotV5):
         best_metric = float('-inf')
 
         if ptc_fn is not None:
-            # Hybrid: 2-ply MC first for all candidates, then PTC for top 3
-            # Step 1: 2-ply MC to rank all candidates
+            # PTC hybrid path (unchanged)
             mc_results = []
             eval_board = board.copy() if hasattr(board, 'copy') else self._copy_board(board)
 
@@ -492,9 +618,8 @@ class DadBot(DadBotV5):
                     mc_eq = equity_1ply
                 mc_results.append((move, mc_eq, leave_val, move_blanks))
 
-            # Step 2: PTC refinement for top 3 by MC equity
             mc_results.sort(key=lambda x: -x[1])
-            ptc_k = 75  # 75 full games per finalist (~0.8s each, SE ~12pts)
+            ptc_k = 75
             ptc_top = min(3, len(mc_results))
 
             for move, mc_eq, leave_val, move_blanks in mc_results[:ptc_top]:
@@ -510,13 +635,9 @@ class DadBot(DadBotV5):
 
                 if ptc_result and ptc_result.get('n_sims', 0) > 0:
                     avg_spread = ptc_result['avg_spread']
-                    if bogowin_fn is not None:
-                        tiles_used = move.get('tiles_used', list(move['word']))
-                        bag_after = max(0, bag_tiles - len(tiles_used))
-                        projected_spread = current_spread + avg_spread
-                        metric = bogowin_fn(int(projected_spread), bag_after)
-                    else:
-                        metric = avg_spread
+                    tiles_used = move.get('tiles_used', list(move['word']))
+                    bag_after = max(0, bag_tiles - len(tiles_used))
+                    metric = self._bogowin_metric(avg_spread, current_spread, bag_after)
                 else:
                     metric = mc_eq
 
@@ -549,13 +670,9 @@ class DadBot(DadBotV5):
                 else:
                     mc_eq = equity_1ply
 
-                if bogowin_fn is not None:
-                    tiles_used = move.get('tiles_used', list(move['word']))
-                    bag_after = max(0, bag_tiles - len(tiles_used))
-                    projected_spread = current_spread + mc_eq
-                    metric = bogowin_fn(int(projected_spread), bag_after)
-                else:
-                    metric = mc_eq
+                tiles_used = move.get('tiles_used', list(move['word']))
+                bag_after = max(0, bag_tiles - len(tiles_used))
+                metric = self._bogowin_metric(mc_eq, current_spread, bag_after)
 
                 if metric > best_metric:
                     best_metric = metric
@@ -563,6 +680,53 @@ class DadBot(DadBotV5):
 
         self._record_time(t_start)
         return best_move
+
+    def _near_endgame_pick(self, board, rack, moves, game_info):
+        """V7 near-endgame handler: reuses v5's multiprocessing with
+        ARM64 Cython workers. Adds tile tracking and Bogowin integration."""
+        from bots.near_endgame import evaluate_near_endgame
+
+        bag_tiles = game_info.get('tiles_in_bag', 1)
+        blanks_on_board = game_info.get('blanks_on_board', [])
+        grid = [row[:] for row in board._grid]
+
+        unseen_pool = _compute_unseen(grid, rack, blanks_on_board)
+
+        # Tile tracker for precise unseen counts
+        tile_counts = None
+        if _flag_bool('V7_TILE_TRACKER'):
+            from collections import Counter
+            tile_counts = Counter(unseen_pool)
+
+        # Time budget from tier
+        tier = _flag('BOT_TIER', 'fast')
+        time_budget = _V7_NE_TIMES.get(tier, 5.0)
+
+        leave_fn = self._get_leave_fn()
+        current_spread = game_info.get('your_score', 0) - game_info.get('opp_score', 0)
+
+        try:
+            result = evaluate_near_endgame(
+                board=board,
+                rack=rack,
+                moves=moves,
+                unseen_pool=unseen_pool,
+                blanks_on_board=blanks_on_board,
+                bag_size=bag_tiles,
+                time_budget=time_budget,
+                leave_fn=leave_fn,
+                tile_counts=tile_counts,
+                current_spread=current_spread,
+                bogowin_fn=self._get_bogowin() if _flag_bool('V7_BOGOWIN') else None,
+                bogowin_blend=_flag_float('V7_BOGOWIN_BLEND', 1.0),
+            )
+            if result is not None:
+                return result
+        except Exception as e:
+            print(f"  [v7] Near-endgame error: {e}", flush=True)
+
+        # Fallback to v5
+        return super().pick_move(board, rack, moves, game_info)
 
     @staticmethod
     def _copy_board(board):
